@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>API 测试</title>
+</head>
+<body>
+    <h1>API 测试</h1>
+    <button onclick="testAPI()">测试连接</button>
+    <pre id="result">点击按钮测试连接</pre>
+
+    <script>
+        async function testAPI() {
+            const resultDiv = document.getElementById('result');
+            try {
+                resultDiv.textContent = '正在连接后端...';
+                
+                const response = await fetch('http://localhost:8000/test-connection', {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                resultDiv.textContent = '后端响应:\n' + JSON.stringify(data, null, 2);
+                
+                // 测试日志接口
+                await fetch('http://localhost:8000/api/debug', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        type: 'info',
+                        message: '测试页面连接成功',
+                        data: {
+                            timestamp: new Date().toISOString()
+                        }
+                    })
+                });
+                
+            } catch (error) {
+                resultDiv.textContent = '错误:\n' + error.message;
+                console.error('API测试失败:', error);
+            }
+        }
+
+        // 页面加载完成后自动测试
+        window.onload = testAPI;
+    </script>
+</body>
+</html> 

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Save Document</title>
+    <script src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
+    <script>
+        Office.onReady(() => {
+            // 提示用户保存文档
+            Office.context.document.saveAsAsync(
+                Office.FileType.Docx,
+                {
+                    fileName: `compliance_report_${new Date().toISOString().split('T')[0]}.docx`
+                },
+                (result) => {
+                    if (result.status === Office.AsyncResultStatus.Failed) {
+                        console.error(result.error.message);
+                    }
+                    // 关闭对话框
+                    Office.context.ui.messageParent('saved');
+                }
+            );
+        });
+    </script>
+</head>
+<body>
+    <p>Saving document...</p>
+</body>
+</html> 

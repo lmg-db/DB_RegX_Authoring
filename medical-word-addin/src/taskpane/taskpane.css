@@ -1,0 +1,7 @@
+/* 隐藏调试信息区域 */
+.debug-info {
+  position: absolute;
+  visibility: hidden;
+  height: 0;
+  overflow: hidden;
+} 

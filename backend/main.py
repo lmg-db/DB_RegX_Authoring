@@ -1,0 +1,1425 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Header, Depends, APIRouter, Request
+from fastapi import Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+import uvicorn
+import os
+import tempfile
+import logging
+from typing import Optional, Literal, List, Dict, Any
+from langchain_ollama import OllamaLLM
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.chains import ConversationalRetrievalChain
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import re
+from google.cloud import translate_v2 as translate
+from sentence_transformers import SentenceTransformer, util
+from pydantic import BaseModel, ValidationError
+from datetime import datetime
+import ssl
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from transformers import MBartForConditionalGeneration, MBart50TokenizerFast
+import io
+import uuid
+from fastapi.security import APIKeyHeader
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+import pandas as pd
+import matplotlib.pyplot as plt
+import base64
+from document_processing import extract_text, analyze_with_llm
+import hashlib
+from utils.text_extraction import extract_text
+from utils.summary_generation import generate_summary
+import json
+from api.prompts import PromptCreate  # 导入模型
+from fastapi.exceptions import RequestValidationError
+from database import init_db
+
+logging.basicConfig(
+    level=logging.DEBUG,  # 显示更详细日志
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI()
+
+# 确保日志中间件是第一个中间件
+@app.middleware("http")
+async def log_requests(request, call_next):
+    logger.info(f"收到请求: {request.method} {request.url}")
+    if request.method == "POST":
+        body = await request.body()
+        logger.debug(f"Request body: {body.decode()}")
+    response = await call_next(request)
+    return response
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 临时允许所有源
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "google_cloud_credentials.json")
+TRANSLATED_DOCUMENTS_DIR = os.path.join(BASE_DIR, "translated_documents")
+
+os.makedirs(TRANSLATED_DOCUMENTS_DIR, exist_ok=True)
+
+# 初始化翻译模型
+mbart_tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+mbart_model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
+
+
+LANGUAGE_CODES = {
+    'zh': 'zh_CN',
+    'en': 'en_XX'
+}
+
+
+mistral = OllamaLLM(
+    base_url='http://localhost:11434',
+    model="mistral:latest",
+    temperature=0.7
+)
+
+llama = OllamaLLM(
+    base_url='http://localhost:11434',
+    model="llama3.2-vision:11b",
+    temperature=0.7
+)
+
+def init_translation_model():
+    try:
+        logger.info("开始初始化翻译模型...")
+        cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+        model_name = "facebook/mbart-large-50-many-to-many-mmt"
+        
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+            logger.info("使用 MPS 设备")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+            logger.info("使用 CUDA 设备")
+        else:
+            device = torch.device("cpu")
+            logger.info("使用 CPU 设备")
+        
+        logger.info("正在加载tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=True,
+            cache_dir=cache_dir
+        )
+        logger.info("tokenizer加载完成")
+        
+        logger.info("正在加载模型...")
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float32,
+            cache_dir=cache_dir,
+            device_map="auto" if device.type != "cpu" else None,
+            low_cpu_mem_usage=True
+        )
+        logger.info("模型加载完成")
+        
+        if device.type == "cpu":
+            model = model.to(device)
+        logger.info(f"模型已移动到 {device} 设备")
+        
+        return tokenizer, model, device
+        
+    except Exception as e:
+        logger.error(f"模型初始化失败: {str(e)}")
+        import traceback
+        logger.error(f"错误堆栈: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"模型加载错误: {str(e)}")
+
+def process_pdf(file_path, tokenizer, translation_model, device):
+    try:
+        logger.info(f"开始处理PDF文件: {file_path}")
+        
+        os.makedirs(TRANSLATED_DOCUMENTS_DIR, exist_ok=True)
+        
+        logger.info("正在加载PDF文件...")
+        loader = PyPDFLoader(file_path)
+        pages = loader.load()
+        logger.info(f"PDF加载完成，共 {len(pages)} 页")
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=50,
+            length_function=len,
+            separators=["\n\n", "\n", "。", ".", "；", ";", "，", ",", "！", "!", "？", "?"]
+        )
+        
+        all_chunks = []
+        original_texts = []
+        translated_texts = []
+        
+        for i, page in enumerate(pages):
+            text = page.page_content.strip()
+            if not text:
+                continue
+                
+            page_chunks = text_splitter.split_text(text)
+            
+            for chunk in page_chunks:
+                all_chunks.append({
+                    'page': i + 1,
+                    'content': chunk
+                })
+        
+        logger.info(f"文本分割完成，共 {len(all_chunks)} 个片段")
+        
+        base_filename = os.path.basename(file_path)
+        if base_filename.endswith('.pdf'):
+            base_filename = base_filename[:-4]
+            
+        txt_file = os.path.join(TRANSLATED_DOCUMENTS_DIR, f"translated_{base_filename}.txt")
+        docx_file = os.path.join(TRANSLATED_DOCUMENTS_DIR, f"translated_{base_filename}.docx")
+        
+        doc = Document()
+        doc.add_heading('文档翻译结果', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        if os.path.exists(txt_file):
+            os.remove(txt_file)
+        
+        successful_translations = 0
+        for i, chunk in enumerate(all_chunks):
+            try:
+                if not chunk['content'].strip():
+                    continue
+                    
+                logger.info(f"正在处理第 {i+1}/{len(all_chunks)} 个片段")
+                logger.info(f"页码: {chunk['page']}")
+                
+                original_texts.append(chunk['content'])
+                
+                translated_text = translate_text(
+                    chunk['content'],
+                    tokenizer,
+                    translation_model,
+                    device
+                )
+                
+                if not translated_text:
+                    continue
+                
+                translated_texts.append(translated_text)
+                
+                with open(txt_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*50}\n")
+                    f.write(f"页码: {chunk['page']}\n")
+                    f.write(f"段落: {i+1}/{len(all_chunks)}\n")
+                    f.write(f"原文：\n{chunk['content']}\n\n")
+                    f.write(f"译文：\n{translated_text}\n")
+                
+                doc.add_heading(f'第{chunk["page"]}页 - 段落{i+1}', level=1)
+                doc.add_heading('原文:', level=2)
+                doc.add_paragraph(clean_text_for_docx(chunk['content']))
+                doc.add_heading('译文:', level=2)
+                doc.add_paragraph(clean_text_for_docx(translated_text))
+                doc.add_paragraph('_' * 50)
+                
+                successful_translations += 1
+                
+            except Exception as e:
+                logger.error(f"处理段落 {i+1} 时出错: {str(e)}")
+                continue
+        
+        if successful_translations == 0:
+            logger.error("没有成功翻译任何内容")
+            return False, None, None, None
+        
+        try:
+            doc.save(docx_file)
+            logger.info("文档保存成功")
+            
+            if os.path.exists(txt_file) and os.path.exists(docx_file):
+                txt_size = os.path.getsize(txt_file)
+                docx_size = os.path.getsize(docx_file)
+                
+                if txt_size > 0 and docx_size > 0:
+                    logger.info(f"文件生成成功: TXT={txt_size}字节, DOCX={docx_size}字节")
+                    return True, base_filename, "\n".join(original_texts), "\n".join(translated_texts)
+                    
+            logger.error("文件验证失败")
+            return False, None, None, None
+            
+        except Exception as e:
+            logger.error(f"保存文档失败: {str(e)}")
+            return False, None, None, None
+            
+    except Exception as e:
+        logger.error(f"PDF处理错误: {str(e)}")
+        return False, None, None, None
+
+def detect_language_and_direction(text):
+    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in text)
+    has_english = bool(re.search('[a-zA-Z]', text))
+    
+    if has_chinese and not has_english:
+        return "zh2en"
+    elif has_english and not has_chinese:
+        return "en2zh"
+    elif has_chinese and has_english:
+        chinese_chars = sum(1 for char in text if '\u4e00' <= char <= '\u9fff')
+        english_chars = sum(1 for char in text if char.isascii())
+        return "zh2en" if chinese_chars > english_chars else "en2zh"
+    else:
+        return "en2zh"
+
+def clean_text_for_docx(text):
+    if not text:
+        return ""
+    return ''.join(char for char in text if char >= ' ' or char in ['\n', '\t'])
+
+def translate_text(text: str, tokenizer, model, device="cpu"):
+    try:
+        logger.info("开始翻译文本...")
+        logger.info(f"输入文本长度: {len(text)}")
+        logger.info(f"使用设备: {device}")
+        
+        direction = detect_language_and_direction(text)
+        logger.info(f"检测到的翻译方向: {direction}")
+        
+        if direction == "zh2en":
+            src_lang = "zh_CN"
+            tgt_lang = "en_XX"
+        else:
+            src_lang = "en_XX"
+            tgt_lang = "zh_CN"
+        
+        logger.info(f"源语言: {src_lang}, 目标语言: {tgt_lang}")
+        
+        try:
+            tokenizer.src_lang = src_lang
+            inputs = tokenizer(text, return_tensors="pt", max_length=1024, truncation=True)
+            logger.info("文本标记化完成")
+            
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            logger.info("输入已移动到设备")
+            
+            with torch.no_grad():
+                logger.info("开始生成翻译...")
+                outputs = model.generate(
+                    **inputs,
+                    forced_bos_token_id=tokenizer.lang_code_to_id[tgt_lang],
+                    max_length=1024,
+                    num_beams=5,
+                    length_penalty=1.2,
+                    no_repeat_ngram_size=3
+                )
+                logger.info("翻译生成完成")
+            
+            translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            logger.info(f"翻译完成，输出文本长度: {len(translated)}")
+            
+            return translated
+            
+        except Exception as e:
+            logger.error(f"翻译过程中出错: {str(e)}")
+            logger.error(f"错误类型: {type(e)}")
+            import traceback
+            logger.error(f"错误堆栈: {traceback.format_exc()}")
+            raise
+        
+    except Exception as e:
+        logger.error(f"翻译函数出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"翻译错误: {str(e)}")
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    tmp_path = None
+    try:
+        logger.info(f"开始处理文件: {file.filename}")
+        
+        if not file.filename.lower().endswith('.pdf'):
+            logger.error("不支持的文件类型")
+            raise HTTPException(status_code=400, detail="只支持PDF文件")
+        
+        try:
+            content = await file.read()
+            file_size = len(content)
+            logger.info(f"文件大小: {file_size / (1024*1024):.2f} MB")
+            
+            if file_size == 0:
+                logger.error("文件为空")
+                raise HTTPException(status_code=400, detail="文件为空")
+                
+            if file_size > 500 * 1024 * 1024:
+                logger.error("文件太大")
+                raise HTTPException(status_code=400, detail="文件大小超过500MB")
+                
+        except Exception as e:
+            logger.error(f"读取文件失败: {str(e)}")
+            raise HTTPException(status_code=400, detail="文件读取失败")
+        
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                tmp_file.write(content)
+                tmp_path = tmp_file.name
+                logger.info(f"临时文件已创建: {tmp_path}")
+        except Exception as e:
+            logger.error(f"创建临时文件失败: {str(e)}")
+            raise HTTPException(status_code=500, detail="无法创建临时文件")
+            
+        try:
+            logger.info("开始初始化翻译模型...")
+            tokenizer, translation_model, device = init_translation_model()
+            logger.info(f"翻译模型初始化完成，使用设备: {device}")
+            
+            logger.info("开始处理PDF文件...")
+            success, base_filename, original_text, translated_text = process_pdf(
+                tmp_path,
+                tokenizer,
+                translation_model,
+                device
+            )
+            
+            if not success:
+                raise HTTPException(status_code=500, detail="PDF处理失败")
+            
+            docx_filename = f"translated_{base_filename}.docx"
+            txt_filename = f"translated_{base_filename}.txt"
+            
+            docx_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, docx_filename)
+            txt_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, txt_filename)
+            
+            if not os.path.exists(docx_path):
+                logger.error(f"DOCX文件不存在: {docx_path}")
+                raise HTTPException(status_code=500, detail="DOCX文件生成失败")
+            
+            if not os.path.exists(txt_path):
+                logger.error(f"TXT文件不存在: {txt_path}")
+                raise HTTPException(status_code=500, detail="TXT文件生成失败")
+            
+            logger.info("文件处理成功完成")
+            return JSONResponse(content={
+                "message": "文件处理成功",
+                "files": {
+                    "docx": docx_filename,
+                    "txt": txt_filename
+                },
+                "original_text": original_text,
+                "translated_text": translated_text
+            })
+            
+        except Exception as e:
+            logger.error(f"处理过程中出错: {str(e)}")
+            import traceback
+            logger.error(f"错误堆栈: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=str(e))
+            
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                    logger.info("临时文件已清理")
+                except Exception as e:
+                    logger.error(f"清理临时文件失败: {str(e)}")
+                
+    except Exception as e:
+        logger.error(f"上传处理失败: {str(e)}")
+        import traceback
+        logger.error(f"错误堆栈: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/downloads/{filename}")
+async def download_file(filename: str):
+    try:
+        file_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, filename)
+        logger.info(f"尝试下载文件: {file_path}")
+        
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            raise HTTPException(status_code=404, detail="文件不存在")
+        
+        content_type = ('application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+                       if filename.endswith('.docx') else 'text/plain')
+        
+        with open(file_path, 'rb') as f:
+            file_content = f.read()
+            
+        return Response(
+            content=file_content,
+            media_type=content_type,
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Access-Control-Expose-Headers': 'Content-Disposition'
+            }
+        )
+    except Exception as e:
+        logger.error(f"下载文件时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/debug")
+async def debug_log(message: dict):
+    log_type = message.get('type', 'info')
+    log_msg = message.get('message', '')
+    log_data = message.get('data', {})
+    log_text = message.get('text', '')
+    log_error = message.get('error', '')
+    
+    log_str = f"[前端日志] [{log_type.upper()}] {log_msg}"
+    if log_text:
+        log_str += f"\n文本: {log_text}"
+    if log_data:
+        log_str += f"\n数据: {log_data}"
+    if log_error:
+        log_str += f"\n错误: {log_error}"
+    
+    log_str = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] {log_str}"
+    
+    if log_type == 'error':
+        logger.error(log_str)
+    else:
+        logger.info(log_str)
+    
+    return {"status": "ok"}
+
+class TranslationRequest(BaseModel):
+    text: str
+    mode: str = "fast"
+    model: str = "local"
+    llm_model: str = "mistral"
+    direction: str  # 必须包含的字段
+
+class TranslationResponse(BaseModel):
+    translatedText: str
+    confidence: float
+    model_used: str
+
+class TextGenerationRequest(BaseModel):
+    text: str
+    template: str = "default"  
+    llm_model: str = None  # 添加模型选择
+
+class TextGenerationResponse(BaseModel):
+    generatedText: str
+    model_used: str
+
+@app.post("/api/translate")
+async def translate(request: TranslationRequest):
+    try:
+        logger.info(f"收到翻译请求: {request}")
+        
+        # 根据模式调整参数
+        if request.mode == "professional":
+            # 使用更复杂的提示词
+            prompt = f"请以专业医学翻译标准翻译以下内容：{request.text}"
+        else:
+            # 快速翻译的简单提示词
+            prompt = f"翻译以下内容：{request.text}"
+        
+        src_lang = 'zh_CN' if request.direction == 'zh2en' else 'en_XX'
+        tgt_lang = 'en_XX' if request.direction == 'zh2en' else 'zh_CN'
+        
+        MAX_LENGTH = 400  
+        text_segments = []
+        current_text = prompt
+        
+        current_text = current_text.replace('\r\n', '\n').replace('\r', '\n')
+        
+        sections = current_text.split('\r')
+        current_segment = ""
+        
+        for section in sections:
+            items = section.split('\n')
+            for item in items:
+                if not item.strip():
+                    continue
+                
+                if item.strip().startswith(('1.', '2.', '3.', '4.', '5.', '6.')):
+                    if current_segment:
+                        text_segments.append(current_segment.strip())
+                    current_segment = item
+                    continue
+                
+                if len(current_segment) + len(item) > MAX_LENGTH:
+                    if current_segment:
+                        text_segments.append(current_segment.strip())
+                    current_segment = item
+                else:
+                    if current_segment:
+                        current_segment += '\n' + item
+                    else:
+                        current_segment = item
+        
+        if current_segment:
+            text_segments.append(current_segment.strip())
+        
+        logger.info(f"分段数量: {len(text_segments)}")
+        for i, seg in enumerate(text_segments):
+            logger.info(f"段落 {i+1} 长度: {len(seg)}")
+        
+        translated_segments = []
+        
+        for segment in text_segments:
+            mbart_tokenizer.src_lang = src_lang
+            
+            encoded = mbart_tokenizer(segment, return_tensors="pt", padding=True)
+            
+            generated_tokens = mbart_model.generate(
+                **encoded,
+                forced_bos_token_id=mbart_tokenizer.lang_code_to_id[tgt_lang],
+                max_length=1024,
+                num_beams=5,
+                length_penalty=1.0,
+                early_stopping=True
+            )
+            
+            segment_translation = mbart_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
+            translated_segments.append(segment_translation)
+        
+        translated_text = '\n\n'.join(translated_segments) 
+        
+        logger.info(f"翻译结果: {translated_text}")
+        return TranslationResponse(
+            translatedText=translated_text,
+            confidence=0.95,
+            model_used="mbart-large-50"
+        )
+    except Exception as e:
+        logger.error(f"翻译错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class QuestionRequest(BaseModel):
+    question: str
+    file_path: str
+    temperature: float = 0.7
+
+@app.post("/api/qa")
+async def question_answer(request: QuestionRequest):
+    try:
+        logger.info(f"收到问答请求: {request}")
+        
+        file_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, request.file_path)
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="文档不存在")
+            
+        with open(file_path, 'r', encoding='utf-8') as f:
+            document_text = f.read()
+            
+        ollama = OllamaLLM(base_url='http://localhost:11434', model="mistral:latest")
+        
+        prompt = f"""你是一个专业的医学文献问答助手。请基于以下医学文献内容，回答用户的问题。
+如果文献中没有相关信息，请直接说明。
+
+医学文献内容：
+{document_text}
+
+用户问题：{request.question}
+
+请用专业、准确且易懂的语言回答问题。如果文献中没有相关信息，请回答"抱歉，文献中没有找到相关信息。"
+"""
+        
+        try:
+            response = ollama.invoke(prompt, temperature=request.temperature)
+            logger.info(f"生成的回答: {response}")
+            
+            return {"answer": response}
+            
+        except Exception as e:
+            logger.error(f"生成回答时出错: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"生成回答失败: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"问答失败: {str(e)}")
+        import traceback
+        logger.error(f"错误堆栈: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def init_google_translate():
+    try:
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = CREDENTIALS_PATH
+        translate_client = translate.Client()
+        return translate_client
+    except Exception as e:
+        logger.error(f"Google翻译客户端初始化失败: {str(e)}")
+        raise
+
+def back_translate(text: str, translate_client):
+    try:
+        detection = translate_client.detect_language(text)
+        source_lang = detection['language']
+        logger.info(f"检测到的原文语言: {source_lang}")
+        
+        intermediate_lang = 'en' if source_lang == 'zh' else 'zh'
+        target_lang = source_lang
+        
+        logger.info(f"翻译方向: {source_lang} -> {intermediate_lang} -> {target_lang}")
+        
+        intermediate_result = translate_client.translate(
+            text,
+            target_language=intermediate_lang,
+            source_language=source_lang
+        )
+        
+        final_result = translate_client.translate(
+            intermediate_result['translatedText'],
+            target_language=target_lang,
+            source_language=intermediate_lang
+        )
+        
+        logger.info("反向翻译完成")
+        return {
+            'original': text,
+            'intermediate': intermediate_result['translatedText'],
+            'final': final_result['translatedText']
+        }
+        
+    except Exception as e:
+        logger.error(f"反向翻译失败: {str(e)}")
+        raise
+
+class TextRequest(BaseModel):
+    text: str
+
+@app.post("/api/back-translate")
+async def back_translate_api(request: TextRequest):
+    try:
+        translate_client = init_google_translate()
+        result = back_translate(request.text, translate_client)
+        return result
+    except Exception as e:
+        logger.error(f"反向翻译API调用失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/")
+async def root():
+    logger.info("收到根路径请求")
+    return {"message": "API 服务正在运行"}
+
+@app.get("/test-connection")
+async def test_connection():
+    logger.info("收到测试连接请求")
+    return {"status": "ok", "message": "连接成功"}
+
+@app.post("/api/generate")
+async def generate_text(request: TextGenerationRequest):
+    try:
+        logger.info(f"收到生成请求: {request}")
+        
+        model = llama if request.llm_model == 'llama' else mistral
+        
+        # 根据不同的模板选择不同的处理逻辑
+        if request.template == 'compliance':
+            # 合规检查的模板
+            template = COMPLIANCE_TEMPLATE
+        elif request.template == 'csr':
+            # CSR生成的模板
+            template = CSR_TEMPLATE
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported template type")
+        
+        prompt = template.format(text=request.text)
+        
+        response = model(prompt)
+        
+        return TextGenerationResponse(
+            generatedText=response.strip(),
+            model_used=request.llm_model or "mistral"
+        )
+        
+    except Exception as e:
+        logger.error(f"生成失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 定义合规检查模板
+COMPLIANCE_TEMPLATE = {
+    "id": "fda-compliance",
+    "title": "FDA Compliance Check",
+    "content": """Please analyze the following text for regulatory compliance:
+
+Text to analyze: {text}
+
+Please provide your analysis in the following structured format:
+
+1. Understanding the Context and Scope:
+• Provide a brief overview of the document's context
+• Identify the type of submission and regulatory framework
+
+2. Identifying Gaps in Provided Documents:
+• List each identified gap using lettered sub-points (a, b, c, etc.)
+• For each gap, cite the specific regulatory requirement it fails to meet
+
+3. Addressing Specific Areas of Focus:
+• Pharmacokinetics: Required data and current status
+• Toxicology: Required studies and current status
+• Safety Pharmacology: Required studies and current status
+
+4. FDA-Specific Considerations:
+• List specific FDA requirements
+• Identify any FDA-specific gaps""",
+    "isDefault": True,
+    "modelType": "compliance",
+    "category": "regulatory"
+}
+
+# 定义 CSR 生成模板
+CSR_TEMPLATE = {
+    "id": "csr-generation",
+    "title": "CSR Generation (NDA)",
+    "content": """Generate a Clinical Study Report (CSR) for an FDA NDA submission based on the content extracted from the provided file.
+
+Content to analyze: {text}
+
+Please generate a comprehensive Clinical Study Report (CSR) with the following structure:
+
+1. Structure & Table of Contents
+• Title Page
+• Synopsis
+• Table of Contents (detailing every major section)
+• List of Abbreviations and Definitions of Terms
+• Ethics
+• IRB/IEC approvals
+• Ethical conduct statement
+• Investigators and Study Administrative Structure
+• Introduction
+• Study Objectives
+• Primary Objectives
+• Secondary Objectives
+• Exploratory Objectives (if applicable)
+• Investigational Plan
+• Study Design
+• Study Population
+• Treatment/Study Medication Details
+• Efficacy Evaluation
+• Safety Evaluation
+• Statistical Methods
+• Sample Size Rationale
+• Analysis Methods for Efficacy and Safety
+• Results
+• Participant Disposition
+• Demographics and Baseline Characteristics
+• Efficacy Results
+• Safety Results (including AEs/SAEs)
+• Discussion and Conclusions
+• References
+• Appendices (e.g., Protocol, Sample CRFs, Patient Data Listings, etc.)
+
+Note: Please maintain professional, scientific language and present data objectively. Include both positive and negative findings where available.""",
+    "isDefault": True,
+    "modelType": "generation",
+    "category": "csr"
+}
+
+@app.post("/api/download-report")
+async def download_report(request: dict):
+    try:
+        content = request.get('content')
+        file_name = request.get('fileName')
+        
+        doc = Document()
+        
+        title = doc.add_heading('Compliance Check Report', 0)
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        date_paragraph = doc.add_paragraph()
+        date_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        date_paragraph.add_run(datetime.now().strftime("%Y-%m-%d")).italic = True
+        
+        for line in content.split('\n'):
+            if line.strip():
+                if line.startswith('  '):  
+                    p = doc.add_paragraph()
+                    p.paragraph_format.left_indent = Inches(0.5)
+                    p.add_run(line.strip())
+                else:  
+                    doc.add_paragraph(line)
+        
+        f = io.BytesIO()
+        doc.save(f)
+        f.seek(0)
+        
+        return Response(
+            content=f.read(),
+            media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            headers={
+                'Content-Disposition': f'attachment; filename="{file_name}"'
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"生成报告失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/log")
+async def log_message(request: dict):
+    try:
+        logger.info(f"Add-in log: {request.get('message')}")
+        if request.get('data'):
+            logger.info(f"Data: {request.get('data')}")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Failed to log message: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 添加提示词管理路由
+class PromptManagementRequest(BaseModel):
+    action: str  # 'create' | 'update' | 'delete'
+    prompt: dict
+
+# 更新默认提示词存储
+prompt_storage = {
+    "default": [
+        CSR_TEMPLATE,
+        COMPLIANCE_TEMPLATE  # 添加合规模板
+    ],
+    "users": {}
+}
+
+# 添加验证日志
+print("验证模板内容长度:")
+for prompt in prompt_storage["default"]:
+    print(f"{prompt['title']}: {len(prompt['content'])} 字符")
+
+@app.get("/api/prompts")
+async def get_prompts():
+    return {
+        "userPrompts": prompt_storage["users"].get("demo-user", []),
+        "defaultPrompts": prompt_storage["default"]
+    }
+
+@app.middleware("http")
+async def validate_api_key(request: Request, call_next):
+    # 允许预检请求
+    if request.method == "OPTIONS":
+        return await call_next(request)
+        
+    # 排除文档路由
+    if request.url.path in ['/docs', '/openapi.json', '/redoc']:
+        return await call_next(request)
+    
+    api_key = request.headers.get('X-API-Key')
+    valid_key = "your-secure-key-here"  # 替换为实际密钥
+    
+    if not api_key or api_key != valid_key:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Invalid or missing API key"},
+            headers={"Access-Control-Allow-Origin": "*"}
+        )
+    return await call_next(request)
+
+@app.post("/api/prompts")
+async def create_prompt(request_data: PromptCreate = Body(...)):
+    logger.info("进入create_prompt路由处理")
+    logger.debug(f"请求头: {request.headers}")
+    print(f"收到请求数据: {request_data.dict()}")
+    return {"test": "ok"}
+
+class ExecutionRequest(BaseModel):
+    text: str
+    prompt_id: str
+    model: Literal['mistral', 'llama']
+
+@app.post("/api/execute")
+async def execute_prompt(request: ExecutionRequest):
+    # 添加详细验证
+    if not request.text.strip():
+        logger.error("执行请求缺少文本内容")
+        raise HTTPException(status_code=422, detail="Text content is required")
+    
+    if not request.prompt_id.strip():
+        logger.error("执行请求缺少提示词ID")
+        raise HTTPException(status_code=422, detail="Prompt ID is required")
+    
+    # 获取完整提示词
+    prompt = next((p for p in prompt_storage["default"] + prompt_storage["users"].get("demo-user", []) 
+                  if p["id"] == request.prompt_id), None)
+    
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+    
+    # 构建完整提示
+    full_prompt = prompt["content"].replace("{text}", request.text)
+    
+    # 根据模型类型调用不同处理
+    if request.model == 'llama':
+        result = compliance_check(full_prompt)
+    else:
+        result = generate_content(full_prompt)
+    
+    return {"result": result}
+
+# 添加生成函数
+def generate_content(prompt: str) -> str:
+    """调用LLM生成内容"""
+    try:
+        llm = OllamaLLM(model="mistral")
+        return llm.invoke(prompt)
+    except Exception as e:
+        logging.error(f"生成内容失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="生成失败")
+
+# 添加合规检查函数
+def compliance_check(prompt: str) -> str:
+    """调用LLM进行合规检查"""
+    try:
+        llm = OllamaLLM(model="llama3.2-vision:11b")
+        return llm.invoke(prompt)
+    except Exception as e:
+        logging.error(f"合规检查失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="合规检查失败")
+
+# 新增属性模型
+class DocumentAttribute(BaseModel):
+    name: str
+    value: str
+    editable: bool
+
+class TemplateAttribute(DocumentAttribute):
+    applicable_models: List[str]
+
+# 新增API端点
+@app.post("/api/save-attributes")
+async def save_attributes(
+    doc_attrs: List[DocumentAttribute],
+    template_attrs: List[TemplateAttribute]
+):
+    try:
+        # 实现属性存储逻辑
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 新增数据模型
+class Source(BaseModel):
+    id: str
+    name: str
+    type: str = "document"  # 默认类型
+    origin: str = "upload"  # 默认来源
+    size: str
+    isTemplate: bool = False
+    summary: str = ""
+
+class Template(BaseModel):
+    id: str
+    name: str
+    category: Literal['clinical', 'regulatory', 'csr']
+
+# 新增API端点
+source_db = [
+    {"id": "doc-001", "name": "Main Protocol", "type": "document", "origin": "internal"},
+    {"id": "cro-2023", "name": "CRO Final Report 2023", "type": "report", "origin": "external"},
+    {"id": "lab-456", "name": "Lab Results Q4", "type": "lab", "origin": "external"}
+]
+
+template_db = [
+    {"id": "clin-001", "name": "Clinical Study Report", "category": "clinical"},
+    {"id": "reg-2023", "name": "EU MDR Template", "category": "regulatory"},
+    {"id": "csr-01", "name": "CSR Brief", "category": "csr"}
+]
+
+@app.get("/api/sources", response_model=List[Source])
+async def get_sources():
+    """Get list of all documents"""
+    try:
+        sources = []
+        for doc_id, info in stored_files.items():
+            sources.append(Source(
+                id=doc_id,
+                name=info["original_name"],
+                size=str(os.path.getsize(info["path"])),
+                type="document",
+                origin="upload",
+                isTemplate=False
+            ))
+        
+        # Add template documents
+        template_docs = [
+            Source(
+                id="template1",
+                name="Main Protocol",
+                size="N/A",
+                type="document",
+                origin="system",
+                isTemplate=True
+            ),
+            Source(
+                id="template2",
+                name="CRO Final Report 2023",
+                size="N/A",
+                type="report",
+                origin="system",
+                isTemplate=True
+            ),
+            Source(
+                id="template3",
+                name="Lab Results Q4",
+                size="N/A",
+                type="lab",
+                origin="system",
+                isTemplate=True
+            )
+        ]
+        
+        return sources + template_docs
+    except Exception as e:
+        logger.error(f"Failed to get sources: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/templates", response_model=List[Template])
+async def get_templates():
+    return template_db
+
+# 添加数据模型
+class VisualizationConfig(BaseModel):
+    chartType: str
+    xAxis: str
+    yAxis: str
+
+class DatasetInfo(BaseModel):
+    data: List[Dict[str, Any]]
+    columns: List[str]
+
+class VisualizationRequest(BaseModel):
+    dataset: DatasetInfo
+    config: VisualizationConfig
+
+# 添加API端点
+dataset_storage = {}
+
+@app.post("/api/datasets/upload")
+async def upload_dataset(file: UploadFile = File(...)):
+    try:
+        logger.info(f"Received dataset upload: {file.filename}")
+        
+        # 检查文件类型
+        valid_extensions = ('.csv', '.xlsx', '.xls')
+        if not file.filename.lower().endswith(valid_extensions):
+            logger.error(f"Invalid file type: {file.filename}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {', '.join(valid_extensions)} files are supported"
+            )
+        
+        # 读取文件内容
+        try:
+            content = await file.read()
+            logger.info(f"File content read: {len(content)} bytes")
+        except Exception as e:
+            logger.error(f"Failed to read file: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to read file")
+        
+        try:
+            # 根据文件类型处理数据
+            file_ext = os.path.splitext(file.filename.lower())[1]
+            if file_ext == '.csv':
+                df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+            elif file_ext in ('.xlsx', '.xls'):
+                df = pd.read_excel(io.BytesIO(content))
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Unsupported file format"
+                )
+                
+            logger.info(f"Dataset loaded: {len(df)} rows, {len(df.columns)} columns")
+            
+            # 获取列名和预览数据
+            columns = df.columns.tolist()
+            preview = df.head(5).to_dict('records')
+            
+            return {
+                "status": "success",
+                "columns": columns,
+                "preview": preview
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to process dataset: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to process dataset: {str(e)}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/generate-visualization")
+async def generate_visualization(request: VisualizationRequest):
+    try:
+        logger.info(f"Generating visualization with config: {request.config}")
+        
+        # 将数据转换为 DataFrame
+        df = pd.DataFrame(request.dataset.data)
+        
+        # 创建图表
+        plt.figure(figsize=(10, 6))
+        plt.clf()  # 清除之前的图表
+        
+        if request.config.chartType == 'bar':
+            df.plot(
+                kind='bar',
+                x=request.config.xAxis,
+                y=request.config.yAxis
+            )
+        elif request.config.chartType == 'line':
+            df.plot(
+                kind='line',
+                x=request.config.xAxis,
+                y=request.config.yAxis
+            )
+        elif request.config.chartType == 'scatter':
+            df.plot(
+                kind='scatter',
+                x=request.config.xAxis,
+                y=request.config.yAxis
+            )
+        elif request.config.chartType == 'pie':
+            df[request.config.yAxis].plot(kind='pie')
+        
+        plt.title(f"{request.config.chartType.capitalize()} Chart")
+        plt.xlabel(request.config.xAxis)
+        plt.ylabel(request.config.yAxis)
+        
+        # 保存图表为 base64 字符串
+        buffer = io.BytesIO()
+        plt.savefig(buffer, format='png')
+        buffer.seek(0)
+        image_base64 = base64.b64encode(buffer.getvalue()).decode()
+        
+        logger.info("Visualization generated successfully")
+        return {
+            "status": "success",
+            "image": image_base64
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate visualization: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate visualization: {str(e)}"
+        )
+
+chat_router = APIRouter()
+
+class ChatMessage(BaseModel):
+    role: str  # 'user' or 'assistant'
+    content: str
+
+class ChatRequest(BaseModel):
+    question: str
+    document_text: str
+    history: List[ChatMessage]
+
+@app.post("/api/chat/word")
+async def chat_with_word(request: ChatRequest):
+    try:
+        logger.info(f"[Chat] Processing request with history length: {len(request.history)}")
+        
+        if not request.history:
+            logger.info("[Chat] No history provided, starting new conversation")
+        else:
+            logger.info(f"[Chat] Last message in history: {request.history[-1].content[:100]}...")
+
+        # 格式化聊天历史
+        formatted_history = [
+            (msg.content, response.content)
+            for msg, response in zip(
+                [m for m in request.history if m.role == "user"],
+                [m for m in request.history if m.role == "assistant"]
+            )
+        ]
+
+        # 处理文档
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        chunks = text_splitter.split_text(request.document_text)
+        
+        # 创建临时向量库
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        vectorstore = FAISS.from_texts(chunks, embeddings)
+
+        # 构建对话链
+        qa = ConversationalRetrievalChain.from_llm(
+            llm=mistral,
+            retriever=vectorstore.as_retriever(),
+            return_source_documents=True
+        )
+        
+        # 执行对话
+        result = await qa.ainvoke({
+            "question": request.question,
+            "chat_history": formatted_history,
+            "context": request.document_text
+        })
+
+        return {"response": result["answer"]}
+        
+    except ValidationError as e:
+        logger.error(f"[Chat] Validation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"[Chat] Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 将路由挂载到主应用
+app.include_router(chat_router, prefix="/api")
+
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+class DocumentMetadata(BaseModel):
+    id: str
+    filename: str
+    content_hash: str
+    upload_time: datetime
+    file_size: int
+    summary: Optional[str] = None
+
+# 文件信息持久化存储路径
+FILES_DB_PATH = os.path.join(os.path.dirname(__file__), "files_db.json")
+
+def load_files_db():
+    if os.path.exists(FILES_DB_PATH):
+        with open(FILES_DB_PATH, 'r') as f:
+            logger.info("Loading files database")
+            return json.load(f)
+    logger.info("Creating new files database")
+    return {}
+
+def save_files_db(files_db):
+    logger.info(f"Saving files database. Current files: {json.dumps(files_db, indent=2)}")
+    with open(FILES_DB_PATH, 'w') as f:
+        json.dump(files_db, f)
+
+# 初始化文件数据库
+stored_files = load_files_db()
+
+@app.post("/api/sources/upload")
+async def upload_document(file: UploadFile = File(...)):
+    try:
+        logger.info(f"Starting upload for file: {file.filename}")
+        
+        # Generate document ID
+        doc_id = str(uuid.uuid4())
+        logger.info(f"Generated new document ID: {doc_id}")
+        
+        # Create filename with ID prefix
+        file_extension = os.path.splitext(file.filename)[1]
+        storage_filename = f"{doc_id}{file_extension}"
+        file_path = os.path.join(UPLOAD_DIR, storage_filename)
+        
+        # Read and save file
+        content = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(content)
+        logger.info(f"File saved as: {storage_filename}")
+        
+        # Store file info
+        logger.info(f"Current stored_files before update: {stored_files}")
+        stored_files[doc_id] = {
+            "filename": storage_filename,
+            "original_name": file.filename,
+            "path": file_path
+        }
+        logger.info(f"Updated stored_files: {stored_files}")
+        
+        # Update and persist file info
+        save_files_db(stored_files)
+        logger.info("File info saved to database")
+        
+        return {
+            "status": "success",
+            "document": Source(
+                id=doc_id,
+                name=file.filename,
+                size=str(len(content)),
+                type="document",
+                origin="upload",
+                isTemplate=False,
+                summary=""
+            ).dict()
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/sources/{doc_id}")
+async def delete_document(doc_id: str):
+    try:
+        logger.info(f"Attempting to delete document: {doc_id}")
+        logger.info(f"Current stored_files: {stored_files}")
+        
+        file_info = stored_files.get(doc_id)
+        if not file_info:
+            logger.error(f"No file info found for id: {doc_id}")
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        file_path = file_info["path"]
+        logger.info(f"Found file path: {file_path}")
+        
+        if not os.path.exists(file_path):
+            logger.error(f"File not found at path: {file_path}")
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        os.remove(file_path)
+        del stored_files[doc_id]
+        save_files_db(stored_files)
+        logger.info(f"File deleted and database updated. Remaining files: {stored_files}")
+        
+        return {"status": "success", "message": "Document deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while deleting document {doc_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def is_template_document(doc_id: str) -> bool:
+    # Add logic to check if document is a template
+    template_ids = ["template1", "template2", "template3"]  # Store these in config
+    return doc_id in template_ids
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": "Validation Error",
+            "errors": exc.errors()
+        },
+    )
+
+# 在FastAPI app创建后初始化数据库
+init_db()
+
+if __name__ == "__main__":
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(
+        certfile="localhost.crt",  
+        keyfile="localhost.key"    
+    )
+    
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=True,
+        ssl_certfile="localhost.crt",
+        ssl_keyfile="localhost.key"
+    ) 

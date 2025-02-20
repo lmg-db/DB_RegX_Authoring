@@ -1,0 +1,61 @@
+.attributes-form {
+  .attribute-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+    height: 32px;
+
+    .attribute-label {
+      width: 150px;
+      margin-right: 12px;
+      text-align: right;
+      font-size: 14px;
+      font-weight: 600;
+      color: #323130;
+    }
+
+    .attribute-value {
+      flex: 1;
+      max-width: 300px;
+
+      .ms-Dropdown {
+        margin: 0;
+        
+        .ms-Dropdown-title {
+          height: 32px;
+          line-height: 30px;
+          border-radius: 2px;
+          padding: 0 28px 0 8px;
+        }
+
+        &:hover .ms-Dropdown-title {
+          border-color: #323130;
+        }
+
+        &.is-disabled .ms-Dropdown-title {
+          background-color: #f3f2f1;
+        }
+      }
+    }
+  }
+
+  .ms-TextField,
+  .ms-Dropdown {
+    margin-bottom: 12px;
+    
+    .ms-Label {
+      font-weight: 600;
+      font-size: 14px;
+    }
+  }
+
+  .ms-TextField-fieldGroup,
+  .ms-Dropdown-title {
+    border-radius: 4px;
+  }
+
+  .required-field::after {
+    content: " *";
+    color: #a4262c;
+  }
+} 

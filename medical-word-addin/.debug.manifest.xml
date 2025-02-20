@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration xmlns="http://schemas.microsoft.com/office/debugging">
+    <DefaultApp>Word</DefaultApp>
+    <LogLevel>Verbose</LogLevel>
+    <DefaultDocument>/path/to/your/document.docx</DefaultDocument>
+</Configuration> 

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DoubleBridge RegX AI Platform</title>
+
+    <!-- Office JavaScript API -->
+    <script type="text/javascript" src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
+
+    <!-- For more information on Fluent UI, visit https://developer.microsoft.com/fluentui -->
+    <link rel="stylesheet" href="https://static2.sharepointonline.com/files/fabric/office-ui-fabric-core/11.0.0/css/fabric.min.css"/>
+</head>
+
+<body class="ms-font-m ms-Fabric">
+    <div id="container">
+        <div id="root"></div>
+    </div>
+    <div id="debug-info" style="display: none;">
+        <h3>调试信息</h3>
+        <div id="debug-content">等待初始化...</div>
+    </div>
+    <div id="debug-console" style="display: none; position: fixed; bottom:0; right:0; background: white; border: 1px solid #ccc; padding: 10px; z-index: 9999;">
+        <div id="debug-log"></div>
+    </div>
+    <script>
+        // 添加调试函数
+        window.logDebug = function(message) {
+            const debugInfo = document.getElementById('debug-content');
+            if (debugInfo && debugInfo.style.display !== 'none') {
+                const timestamp = new Date().toISOString();
+                debugInfo.textContent += '\n' + timestamp + ': ' + message;
+                debugInfo.scrollTop = debugInfo.scrollHeight;
+            }
+        };
+        // 记录页面加载
+        window.logDebug('页面已加载');
+
+        window.logToWord = function(message) {
+            const log = document.getElementById('debug-log');
+            if(log) {
+                log.innerHTML += `<div>${new Date().toLocaleTimeString()}: ${message}</div>`;
+            }
+            // 使用正确的异步对话框API
+            Office.context.ui.displayDialogAsync(
+                'data:text/plain,' + encodeURIComponent(message),
+                { height: 40, width: 300 },
+                function (result) {
+                    if (result.status !== Office.AsyncResultStatus.Succeeded) {
+                        console.error('Dialog error:', result.error);
+                    }
+                }
+            );
+        };
+    </script>
+</body>
+</html> 

@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "ES6",
+    "module": "CommonJS",
+    "jsx": "react",
+    "moduleResolution": "node",
+    "sourceMap": true,
+    "experimentalDecorators": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "allowJs": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "strict": true,
+    "lib": ["ES6", "DOM"],
+    "baseUrl": "/Users/roboticssn/Documents/code/project/chatbot/medical-word-addin",
+    "paths": {
+      "@services/*": ["src/services/*"]
+    },
+    "typeRoots": [
+      "node_modules/@types"
+    ],
+    "types": [
+      "office-js",
+      "node",
+      "react",
+      "react-dom"
+    ]
+  },
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "build"
+  ]
+} 

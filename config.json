@@ -1,0 +1,17 @@
+{
+  "contentSecurityPolicy": {
+    "connect-src": ["'self'", "localhost:8000"],
+    "script-src": ["'self'", "https://appsforoffice.microsoft.com"],
+    "img-src": ["'self'", "https://your-cdn.com"],
+    "style-src": ["'self'", "'unsafe-inline'"]
+  },
+  "api": {
+    "baseUrl": "http://localhost:8000",
+    "timeout": 30000
+  },
+  "features": {
+    "translation": true,
+    "rewrite": true,
+    "formatting": true
+  }
+} 

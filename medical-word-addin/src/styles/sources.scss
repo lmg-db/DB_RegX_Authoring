@@ -1,0 +1,27 @@
+.upload-area {
+  border: 2px dashed #f0f0f0;
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+  transition: border-color 0.3s ease;
+  
+  &:hover {
+    border-color: #0078d4;
+    background-color: #f8f8f8;
+  }
+
+  .upload-label {
+    cursor: pointer;
+    
+    span {
+      display: block;
+      margin: 8px 0;
+      color: #666;
+      
+      &:first-of-type {
+        font-weight: 600;
+        color: #333;
+      }
+    }
+  }
+} 
