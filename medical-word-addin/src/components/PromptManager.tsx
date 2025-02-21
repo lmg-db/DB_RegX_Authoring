@@ -10,10 +10,11 @@ interface PromptManagerProps {
   isAdminUser: boolean;
   selectedPrompt?: Prompt;
   onSelectedPromptChange: (prompt: Prompt | undefined) => void;
+  onSwitchToPrompts: () => void;
   styles?: IStyleFunctionOrObject<any, any>;
 }
 
-const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute, selectedModel, isAdminUser, selectedPrompt, onSelectedPromptChange }) => {
+const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute, selectedModel, isAdminUser, selectedPrompt, onSelectedPromptChange, onSwitchToPrompts }) => {
   const [prompts, setPrompts] = useState<{ user: Prompt[]; default: Prompt[] }>({ user: [], default: [] });
   const [editContent, setEditContent] = useState('');
   const [isEditing, setIsEditing] = useState(false);
@@ -106,19 +107,31 @@ const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute
 
   const handleCreate = async () => {
     try {
-      await managePrompt({
+      if (!newPrompt.title || !newPrompt.content) {
+        Office.context.ui.displayDialogAsync(
+          'data:text/plain,' + encodeURIComponent('Title and content are required'),
+          { height: 40, width: 300 }
+        );
+        return;
+      }
+      
+      const response = await managePrompt({
         action: 'create',
         prompt: {
           ...newPrompt,
-          modelType: selectedModel === 'llama' ? 'compliance' : 'generation'
+          modelType: selectedModel === 'llama' ? 'compliance' : 'generation',
+          scope: 'team'
         }
       });
+      
       setShowNewDialog(false);
       await loadPrompts();
-      showMessage('success', 'Prompt created successfully');
     } catch (error) {
-      console.error('Error creating prompt:', error);
-      showMessage('error', `Error: ${error.message}`);
+      console.error('Create error:', error);
+      Office.context.ui.displayDialogAsync(
+        'data:text/plain,' + encodeURIComponent('Failed to create prompt: ' + error.message),
+        { height: 60, width: 300 }
+      );
     }
   };
 
@@ -142,59 +155,54 @@ const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute
 
   const promptOptions: IDropdownOption[] = [
     {
-      key: 'generation-header',
-      text: 'Document Generation',
-      itemType: DropdownMenuItemType.Header,
+      key: 'predefined-header',
+      text: 'Predefined Prompts',
+      itemType: DropdownMenuItemType.Header
     },
-    ...prompts.default
-      .filter(p => p.modelType === 'generation')
-      .map(p => ({
-        key: p.id,
-        text: `📄 ${p.title}`,
-        data: p,
-      })),
-    {
-      key: 'compliance-header',
-      text: 'Compliance Verification',
-      itemType: DropdownMenuItemType.Header,
-    },
-    ...prompts.default
-      .filter(p => p.modelType === 'compliance')
-      .map(p => ({
-        key: p.id,
-        text: `✅ ${p.title}`,
-        data: p,
-      })),
-    {
-      key: 'user-header',
-      text: 'My Prompts',
-      itemType: DropdownMenuItemType.Header,
-    },
-    ...prompts.user.map(p => ({
-      key: p.id,
-      text: `✏️ ${p.title}`,
-      data: p,
-    })),
+    // 使用原有的预定义提示词
     ...prompts.default.map(p => ({
       key: p.id,
       text: p.title,
-      data: p,
-    }))
+      data: p
+    })),
+    {
+      key: 'custom-header',
+      text: 'Custom Prompts',
+      itemType: DropdownMenuItemType.Header
+    },
+    // 只显示用户实际创建的自定义提示词
+    ...(prompts.user || [])
+      .filter(p => p.scope === 'user' || p.scope === 'team')  // 只显示用户或团队范围的提示词
+      .map(p => ({
+        key: p.id,
+        text: p.title,
+        data: p
+      }))
   ];
 
   const onRenderOption = (option?: IDropdownOption): JSX.Element => {
+    if (option?.itemType === DropdownMenuItemType.Header) {
+      return (
+        <div style={{ 
+          padding: '8px 16px', 
+          fontWeight: 600,
+          fontSize: '12px',
+          color: '#666'
+        }}>
+          {option.text}
+        </div>
+      );
+    }
+
     const prompt = option?.data as Prompt;
     return (
-      <div className={styles.promptOption}>
+      <div style={{
+        padding: '8px 16px',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between'
+      }}>
         <span>{option?.text}</span>
-        <IconButton
-          iconProps={{ iconName: 'Target' }}
-          title="执行此提示词"
-          onClick={(e) => {
-            e.stopPropagation();
-            onExecute(prompt.content);
-          }}
-        />
       </div>
     );
   };
@@ -226,24 +234,9 @@ const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute
 
   const handleEdit = () => {
     if (selectedPrompt) {
-      // 强制从服务器获取最新数据
-      getPrompts().then(response => {
-        const allPrompts = [...response.defaultPrompts, ...response.userPrompts];
-        const fullPrompt = allPrompts.find(p => p.id === selectedPrompt.id);
-        
-        // 添加调试日志
-        console.log('Full prompt content:', fullPrompt?.content);
-        
-        if (fullPrompt) {
-          setEditContent(fullPrompt.content);
-          setIsEditing(true);
-        } else {
-          showMessage('error', 'Prompt not found on server');
-        }
-      }).catch(error => {
-        console.error('Error fetching full prompt:', error);
-        showMessage('error', 'Failed to load prompt content');
-      });
+      // 切换到 Prompts 界面并传递要编辑的提示词
+      onSwitchToPrompts();
+      // 可以通过 URL 参数或状态管理传递要编辑的提示词 ID
     }
   };
 
@@ -301,7 +294,7 @@ const PromptManager: React.FC<PromptManagerProps> = ({ onPromptSelect, onExecute
         />
         <PrimaryButton
           text="New"
-          onClick={() => setShowNewDialog(true)}
+          onClick={onSwitchToPrompts}
           styles={{
             root: {
               height: '28px',

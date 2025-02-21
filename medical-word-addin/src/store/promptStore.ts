@@ -9,6 +9,7 @@ export interface Prompt {
   task?: string;
   templates?: string[];
   scope: 'user' | 'team';
+  isLibrary?: boolean;
 }
 
 interface PromptStore {
@@ -20,6 +21,11 @@ interface PromptStore {
   setSelectedPrompt: (prompt: Prompt | null) => void;
 }
 
+interface PromptResponse {
+  defaultPrompts: Prompt[];
+  userPrompts: Prompt[];
+}
+
 export const usePromptStore = create<PromptStore>((set) => ({
   prompts: [],
   selectedPrompt: null,
@@ -29,8 +35,14 @@ export const usePromptStore = create<PromptStore>((set) => ({
   loadPrompts: async () => {
     set({ isLoading: true, error: null });
     try {
-      const response = await api.get('/prompts');
-      set({ prompts: response.data });
+      const response = await api.get<PromptResponse>('/api/prompts');
+      set({
+        prompts: [
+          ...response.data.defaultPrompts,
+          ...response.data.userPrompts
+        ],
+        isLoading: false
+      });
     } catch (error: any) {
       set({ 
         error: error.message || 'Failed to load prompts',

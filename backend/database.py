@@ -20,7 +20,7 @@ def get_db():
                 model_type TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 task TEXT,
-                templates TEXT,
+                templates TEXT DEFAULT '[]',
                 created_at TIMESTAMP
             )
         ''')
@@ -39,7 +39,7 @@ def init_db():
                 model_type TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 task TEXT,
-                templates TEXT,
+                templates TEXT DEFAULT '[]',
                 created_at TIMESTAMP
             )
         ''')

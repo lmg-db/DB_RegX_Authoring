@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Stack, TextField, DefaultButton, Text, IDropdownOption, MessageBar, MessageBarType, Spinner } from '@fluentui/react';
+import { Stack, TextField, DefaultButton, Text, IDropdownOption, MessageBar, MessageBarType, Spinner, IconButton, PrimaryButton } from '@fluentui/react';
 import { usePromptStore } from '../store/promptStore';
 import { Prompt } from '../store/promptStore';
 import { PromptManager } from './PromptManager';
@@ -9,38 +9,59 @@ import { api } from '../services/api';
 interface PromptsPanelProps {
   onSaveToLibrary?: () => void;
   onSaveToCustom?: () => void;
+  selectedModel: string;
+  onPromptSelect: (prompt: Prompt) => void;
+  initialPromptId?: string;
 }
 
 export const PromptsPanel: React.FC<PromptsPanelProps> = ({
   onSaveToLibrary,
-  onSaveToCustom
+  onSaveToCustom,
+  selectedModel,
+  onPromptSelect,
+  initialPromptId
 }) => {
   const [title, setTitle] = React.useState('');
   const [task, setTask] = React.useState('');
   const [promptDetails, setPromptDetails] = React.useState('');
-  const [selectedTemplates, setSelectedTemplates] = React.useState<string[]>([]);
   const [selectedPrompt, setSelectedPrompt] = React.useState<Prompt | null>(null);
-  const { prompts, isLoading, error, loadPrompts } = usePromptStore();
-
-  // 在组件顶部添加
-  React.useEffect(() => {
-    console.log('Current prompts:', prompts);
-    console.log('Loading state:', isLoading);
-    console.log('Error state:', error);
-  }, [prompts, isLoading, error]);
-
-  // 在useEffect中添加
-  React.useEffect(() => {
-    (window as any).logToWord(`Prompts loaded: ${JSON.stringify(prompts)}`);
-  }, [prompts]);
+  const [isEditing, setIsEditing] = React.useState(false);
+  const { 
+    prompts, 
+    isLoading, 
+    error, 
+    loadPrompts 
+  } = usePromptStore();
 
   // 在useEffect中添加
   React.useEffect(() => {
-    loadPrompts();
-    // 每5秒轮询数据
-    const interval = setInterval(loadPrompts, 5000);
-    return () => clearInterval(interval);
+    const loadData = async () => {
+      try {
+        usePromptStore.setState({ isLoading: true });
+        await loadPrompts();
+        usePromptStore.setState({ isLoading: false });
+      } catch (error) {
+        console.error('Failed to load prompts:', error);
+        usePromptStore.setState({ isLoading: false });
+      }
+    };
+    loadData();
   }, [loadPrompts]);
+
+  // 修改 useEffect，在找到提示词后立即设置表单内容
+  React.useEffect(() => {
+    if (initialPromptId) {
+      const prompt = prompts.find(p => p.id === initialPromptId);
+      if (prompt) {
+        setSelectedPrompt(prompt);
+        setIsEditing(true);
+        // 立即设置表单内容
+        setTitle(prompt.title);
+        setTask(prompt.task || '');
+        setPromptDetails(prompt.content);
+      }
+    }
+  }, [initialPromptId, prompts]); // 添加 prompts 作为依赖
 
   // 处理选择提示词
   const handlePromptSelect = (prompt: Prompt) => {
@@ -48,7 +69,6 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
     setTitle(prompt.title);
     setTask(prompt.task || '');
     setPromptDetails(prompt.content);
-    setSelectedTemplates(prompt.templates || []);
   };
 
   // 处理新建提示词
@@ -57,32 +77,60 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
     setTitle('');
     setTask('');
     setPromptDetails('');
-    setSelectedTemplates([]);
   };
 
   // 保存提示词
   const handleSave = async (isLibrary: boolean) => {
     try {
-      if (!title.trim() || !promptDetails.trim()) {
-        alert('标题和内容为必填项');
-        return;
-      }
+      usePromptStore.setState({ isLoading: true });
+      
+      const method = selectedPrompt ? 'put' : 'post';
+      const url = selectedPrompt ? `/api/prompts/${selectedPrompt.id}` : '/api/prompts';
 
-      const response = await api.post('/prompts', {
+      await api[method](url, {
         title: title.trim(),
         content: promptDetails.trim(),
         model_type: "generation",
         scope: isLibrary ? "team" : "user",
-        task: task.trim(),
-        templates: selectedTemplates
+        task: task.trim()
       });
 
-      // 刷新列表
       await loadPrompts();
       handleNewPrompt();
     } catch (error) {
       console.error('保存失败:', error);
-      alert('保存失败，请检查控制台日志');
+      Office.context.ui.displayDialogAsync(
+        'data:text/plain,' + encodeURIComponent(`保存失败: ${error.message}`),
+        { height: 60, width: 300 }
+      );
+    } finally {
+      usePromptStore.setState({ isLoading: false });
+    }
+  };
+
+  // 显示预定义模板
+  const libraryPrompts = prompts.filter(p => 
+    p.isLibrary && 
+    (p.model_type === 'generation' || p.model_type === 'compliance')
+  );
+
+  // 显示用户提示词 
+  const userPrompts = prompts.filter(p => !p.isLibrary);
+
+  const handleDelete = async () => {
+    if (!selectedPrompt) return;
+
+    try {
+      console.log('Deleting prompt ID:', selectedPrompt.id);
+      await api.delete(`/api/prompts/${selectedPrompt.id}`);
+      await loadPrompts();
+      handleNewPrompt();
+    } catch (error) {
+      console.error('Delete error details:', error.response?.data || error.message);
+      Office.context.ui.displayDialogAsync(
+        'data:text/plain,' + encodeURIComponent(`删除失败: ${error.message}`),
+        { height: 60, width: 300 }
+      );
     }
   };
 
@@ -148,24 +196,25 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
               prompts
                 .filter(prompt => prompt.scope === 'team')
                 .map(prompt => (
-                  <Text
-                    key={prompt.id}
-                    onClick={() => handlePromptSelect(prompt)}
-                    styles={{
-                      root: {
-                        color: selectedPrompt?.id === prompt.id ? '#0078d4' : '#666',
-                        cursor: 'pointer',
-                        padding: '6px 8px',
-                        fontSize: '12px',
-                        backgroundColor: selectedPrompt?.id === prompt.id ? '#f3f2f1' : 'transparent',
-                        ':hover': {
-                          backgroundColor: '#f3f2f1'
+                  <div key={prompt.id} style={{ display: 'flex', alignItems: 'center' }}>
+                    <Text
+                      onClick={() => handlePromptSelect(prompt)}
+                      styles={{
+                        root: {
+                          color: selectedPrompt?.id === prompt.id ? '#0078d4' : '#666',
+                          cursor: 'pointer',
+                          padding: '6px 8px',
+                          fontSize: '12px',
+                          backgroundColor: selectedPrompt?.id === prompt.id ? '#f3f2f1' : 'transparent',
+                          ':hover': {
+                            backgroundColor: '#f3f2f1'
+                          }
                         }
-                      }
-                    }}
-                  >
-                    {prompt.title}
-                  </Text>
+                      }}
+                    >
+                      {prompt.title}
+                    </Text>
+                  </div>
                 ))
             )
           )}
@@ -195,29 +244,33 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
             {selectedPrompt ? `Current Prompt - ${selectedPrompt.title}` : 'New Prompt'}
           </Text>
           <Stack horizontal tokens={{ childrenGap: 8 }}>
-            <DefaultButton
-              text="Save to Library"
+            <PrimaryButton
+              text="Save"
               onClick={() => handleSave(true)}
               styles={{
                 root: {
-                  backgroundColor: '#f3f2f1',
-                  height: '28px',
-                  minWidth: '100px',
-                  padding: '0 10px',
-                  fontSize: '12px'
+                  backgroundColor: '#0078d4',
+                  color: 'white',
+                  fontSize: '12px',
+                  minWidth: 80,
+                  padding: '0 8px'
                 }
               }}
             />
             <DefaultButton
-              text="Save to Custom"
-              onClick={() => handleSave(false)}
+              text="Delete"
+              onClick={async () => {
+                if (selectedPrompt) {
+                  await handleDelete();
+                }
+              }}
               styles={{
                 root: {
-                  backgroundColor: '#e1efff',
-                  height: '28px',
-                  minWidth: '100px',
-                  padding: '0 10px',
-                  fontSize: '12px'
+                  backgroundColor: '#d13438',
+                  color: 'white',
+                  fontSize: '12px',
+                  minWidth: 80,
+                  padding: '0 8px'
                 }
               }}
             />
@@ -233,33 +286,15 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
               }
             }}>Title</Text>
             <TextField
-              label="Title"
               required
               value={title}
               onChange={(_, v) => setTitle(v || '')}
               errorMessage={!title ? 'Required field' : undefined}
-            />
-          </Stack>
-
-          <Stack>
-            <Text styles={{
-              root: {
-                fontSize: '13px',
-                marginBottom: '4px'
-              }
-            }}>Task</Text>
-            <TextField
-              placeholder="Free Text"
-              value={task}
               styles={{
                 fieldGroup: {
                   height: '32px'
-                },
-                field: {
-                  fontSize: '13px'
                 }
               }}
-              onChange={(_, newValue) => setTask(newValue || '')}
             />
           </Stack>
 
@@ -269,56 +304,40 @@ export const PromptsPanel: React.FC<PromptsPanelProps> = ({
                 fontSize: '13px',
                 marginBottom: '4px'
               }
-            }}>Prompt Details</Text>
+            }}>Task Description</Text>
             <TextField
-              label="Content"
               multiline
-              rows={10}
-              required
-              value={promptDetails}
-              onChange={(_, v) => setPromptDetails(v || '')}
-              errorMessage={!promptDetails ? 'Required field' : undefined}
+              rows={3}
+              value={task}
+              onChange={(_, v) => setTask(v || '')}
+              styles={{
+                field: {
+                  minHeight: '60px'
+                }
+              }}
             />
           </Stack>
 
           <Stack>
-            <Stack horizontal horizontalAlign="space-between" verticalAlign="center">
-              <Text styles={{
-                root: {
-                  fontSize: '13px',
-                  marginBottom: '4px'
-                }
-              }}>Templates (1)</Text>
-              <Text styles={{
-                root: {
-                  fontSize: '16px',
-                  cursor: 'pointer',
-                  color: '#0078d4'
-                }
-              }}>+</Text>
-            </Stack>
-            <Stack styles={{
+            <Text styles={{
               root: {
-                backgroundColor: '#f3f2f1',
-                padding: '8px 12px',
-                minHeight: '32px'
+                fontSize: '13px',
+                marginBottom: '4px'
               }
-            }}>
-              <Stack horizontal horizontalAlign="space-between" verticalAlign="center">
-                <Text styles={{
-                  root: {
-                    fontSize: '13px'
-                  }
-                }}>FDA CSR Template.pdf</Text>
-                <Text styles={{
-                  root: {
-                    fontSize: '12px',
-                    cursor: 'pointer',
-                    color: '#666'
-                  }
-                }}>×</Text>
-              </Stack>
-            </Stack>
+            }}>Prompt Content</Text>
+            <TextField
+              multiline
+              required
+              rows={12}
+              value={promptDetails}
+              onChange={(_, v) => setPromptDetails(v || '')}
+              errorMessage={!promptDetails ? 'Required field' : undefined}
+              styles={{
+                field: {
+                  minHeight: '240px'
+                }
+              }}
+            />
           </Stack>
         </Stack>
       </Stack>

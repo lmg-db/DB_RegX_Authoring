@@ -68,7 +68,91 @@ export const DataVisualizer: React.FC = () => {
   };
 
   return (
-    <Stack tokens={{ childrenGap: 20 }}>
+    <Stack styles={{
+      root: {
+        width: '680px',
+        minWidth: '680px',
+        maxWidth: '680px',
+        padding: '12px',
+        backgroundColor: 'white',
+        border: '1px solid #e1e1e1',
+        borderRadius: '4px'
+      }
+    }}>
+      <Stack horizontal horizontalAlign="space-between" verticalAlign="center">
+        <Text variant="mediumPlus" styles={{ 
+          root: { 
+            fontSize: '14px',
+            fontWeight: '600'
+          } 
+        }}>
+          Data Visualization
+        </Text>
+        <Stack horizontal tokens={{ childrenGap: 8 }}>
+          <Dropdown
+            placeholder="Chart Type"
+            options={[
+              { key: 'bar', text: 'Bar Chart' },
+              { key: 'line', text: 'Line Chart' },
+              { key: 'pie', text: 'Pie Chart' }
+            ]}
+            styles={{
+              dropdown: { 
+                width: 120,
+                height: '28px'
+              }
+            }}
+          />
+          <Dropdown
+            placeholder="X Axis"
+            options={currentDataset?.columns?.map(col => ({
+              key: col,
+              text: col
+            })) || []}
+            styles={{
+              dropdown: { 
+                width: 120,
+                height: '28px'
+              }
+            }}
+          />
+          <Dropdown
+            placeholder="Y Axis"
+            options={currentDataset?.columns?.map(col => ({
+              key: col,
+              text: col
+            })) || []}
+            styles={{
+              dropdown: { 
+                width: 120,
+                height: '28px'
+              }
+            }}
+          />
+        </Stack>
+      </Stack>
+      
+      <div style={{ 
+        width: '100%',
+        height: '300px',
+        marginTop: '12px',
+        border: '1px solid #e1e1e1',
+        borderRadius: '4px',
+        overflow: 'hidden'
+      }}>
+        {generatedImage && (
+          <img 
+            src={`data:image/png;base64,${generatedImage}`}
+            alt="data visualization"
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain'
+            }}
+          />
+        )}
+      </div>
+
       {/* File upload area */}
       <Stack>
         <Text variant="large">Upload Dataset (CSV/XLSX)</Text>
@@ -103,32 +187,6 @@ export const DataVisualizer: React.FC = () => {
         </Stack.Item>
       )}
 
-      {/* Chart type selection */}
-      <Stack>
-        <Text variant="large">Chart Type</Text>
-        <Dropdown
-          placeholder="Select a chart type"
-          options={chartTypes}
-          selectedKey={visualizationConfig.chartType}
-          onChange={(_, item) => item && updateConfig({ chartType: item.key as any })}
-        />
-      </Stack>
-      
-      {currentDataset?.columns && (
-        <>
-          <Dropdown
-            label="X Axis"
-            options={currentDataset.columns.map(c => ({ key: c, text: c }))}
-            onChange={(_, item) => item && updateConfig({ xAxis: item.key as string })}
-          />
-          <Dropdown
-            label="Y Axis"
-            options={currentDataset.columns.map(c => ({ key: c, text: c }))}
-            onChange={(_, item) => item && updateConfig({ yAxis: item.key as string })}
-          />
-        </>
-      )}
-
       {/* Generate visualization button */}
       <PrimaryButton
         text="Generate Visualization"
@@ -137,15 +195,6 @@ export const DataVisualizer: React.FC = () => {
       />
       
       {isGenerating && <Spinner label="Generating visualization..." />}
-
-      {/* Result display */}
-      {generatedImage && (
-        <img 
-          src={`data:image/png;base64,${generatedImage}`} 
-          alt="Generated visualization"
-          style={{ maxWidth: '100%', border: '1px solid #ddd' }}
-        />
-      )}
 
       {/* Add error message display */}
       {error && (

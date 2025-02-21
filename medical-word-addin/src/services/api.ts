@@ -276,4 +276,23 @@ export const api = {
       throw error;
     }
   }
+};
+
+const promptCache = new Map();
+
+export const loadPrompts = async (forceRefresh = false) => {
+  const cacheKey = 'prompts';
+  
+  if (!forceRefresh && promptCache.has(cacheKey)) {
+    return promptCache.get(cacheKey);
+  }
+
+  const data = await api.get('/api/prompts');
+  const merged = [
+    ...hardcodedPrompts, // 前端硬编码的预定义提示词
+    ...data.filter((p: Prompt) => p.scope === 'user')
+  ];
+  
+  promptCache.set(cacheKey, merged);
+  return merged;
 }; 

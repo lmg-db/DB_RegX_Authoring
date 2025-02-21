@@ -1,16 +1,16 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Response, Header, Depends, APIRouter, Request
 from fastapi import Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 import uvicorn
 import os
 import tempfile
 import logging
 from typing import Optional, Literal, List, Dict, Any
 from langchain_ollama import OllamaLLM
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 import torch
@@ -40,9 +40,13 @@ import hashlib
 from utils.text_extraction import extract_text
 from utils.summary_generation import generate_summary
 import json
-from api.prompts import PromptCreate  # 导入模型
+from api.prompts import PromptCreate, app as prompts_router
 from fastapi.exceptions import RequestValidationError
 from database import init_db
+import glob
+from pathlib import Path
+import shutil
+import numpy as np
 
 logging.basicConfig(
     level=logging.DEBUG,  # 显示更详细日志
@@ -55,29 +59,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+app.include_router(prompts_router)  # 挂载路由
 
-# 确保日志中间件是第一个中间件
-@app.middleware("http")
-async def log_requests(request, call_next):
-    logger.info(f"收到请求: {request.method} {request.url}")
-    if request.method == "POST":
-        body = await request.body()
-        logger.debug(f"Request body: {body.decode()}")
-    response = await call_next(request)
-    return response
-
+# 添加CORS中间件
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 临时允许所有源
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],   # 允许所有方法
+    allow_headers=["*"],   # 允许所有头
+    expose_headers=["Content-Disposition"]  # 暴露必要头信息
 )
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CREDENTIALS_PATH = os.path.join(BASE_DIR, "google_cloud_credentials.json")
-TRANSLATED_DOCUMENTS_DIR = os.path.join(BASE_DIR, "translated_documents")
+# 获取项目根目录
+BASE_DIR = Path(__file__).parent.resolve()
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)  # 确保目录存在
 
-os.makedirs(TRANSLATED_DOCUMENTS_DIR, exist_ok=True)
+print(f"✅ 上传目录已创建：{UPLOAD_DIR.absolute()}")
 
 # 初始化翻译模型
 mbart_tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-many-to-many-mmt")
@@ -152,7 +151,7 @@ def process_pdf(file_path, tokenizer, translation_model, device):
     try:
         logger.info(f"开始处理PDF文件: {file_path}")
         
-        os.makedirs(TRANSLATED_DOCUMENTS_DIR, exist_ok=True)
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
         
         logger.info("正在加载PDF文件...")
         loader = PyPDFLoader(file_path)
@@ -189,8 +188,8 @@ def process_pdf(file_path, tokenizer, translation_model, device):
         if base_filename.endswith('.pdf'):
             base_filename = base_filename[:-4]
             
-        txt_file = os.path.join(TRANSLATED_DOCUMENTS_DIR, f"translated_{base_filename}.txt")
-        docx_file = os.path.join(TRANSLATED_DOCUMENTS_DIR, f"translated_{base_filename}.docx")
+        txt_file = os.path.join(UPLOAD_DIR, f"translated_{base_filename}.txt")
+        docx_file = os.path.join(UPLOAD_DIR, f"translated_{base_filename}.docx")
         
         doc = Document()
         doc.add_heading('文档翻译结果', 0).alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -397,8 +396,8 @@ async def upload_file(file: UploadFile = File(...)):
             docx_filename = f"translated_{base_filename}.docx"
             txt_filename = f"translated_{base_filename}.txt"
             
-            docx_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, docx_filename)
-            txt_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, txt_filename)
+            docx_path = os.path.join(UPLOAD_DIR, docx_filename)
+            txt_path = os.path.join(UPLOAD_DIR, txt_filename)
             
             if not os.path.exists(docx_path):
                 logger.error(f"DOCX文件不存在: {docx_path}")
@@ -442,7 +441,7 @@ async def upload_file(file: UploadFile = File(...)):
 @app.get("/downloads/{filename}")
 async def download_file(filename: str):
     try:
-        file_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, filename)
+        file_path = os.path.join(UPLOAD_DIR, filename)
         logger.info(f"尝试下载文件: {file_path}")
         
         if not os.path.exists(file_path):
@@ -608,7 +607,7 @@ async def question_answer(request: QuestionRequest):
     try:
         logger.info(f"收到问答请求: {request}")
         
-        file_path = os.path.join(TRANSLATED_DOCUMENTS_DIR, request.file_path)
+        file_path = os.path.join(UPLOAD_DIR, request.file_path)
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="文档不存在")
             
@@ -701,9 +700,12 @@ async def back_translate_api(request: TextRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-async def root():
-    logger.info("收到根路径请求")
-    return {"message": "API 服务正在运行"}
+async def health_check():
+    return {
+        "status": "running",
+        "upload_dir": str(UPLOAD_DIR.absolute()),
+        "files": [f.name for f in UPLOAD_DIR.glob("*")]
+    }
 
 @app.get("/test-connection")
 async def test_connection():
@@ -870,31 +872,16 @@ async def log_message(request: dict):
         logger.error(f"Failed to log message: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# 添加提示词管理路由
-class PromptManagementRequest(BaseModel):
-    action: str  # 'create' | 'update' | 'delete'
-    prompt: dict
+# 在文件顶部添加预定义提示词
+PREDEFINED_PROMPTS = [CSR_TEMPLATE, COMPLIANCE_TEMPLATE]
 
-# 更新默认提示词存储
-prompt_storage = {
-    "default": [
-        CSR_TEMPLATE,
-        COMPLIANCE_TEMPLATE  # 添加合规模板
-    ],
-    "users": {}
-}
-
-# 添加验证日志
-print("验证模板内容长度:")
-for prompt in prompt_storage["default"]:
-    print(f"{prompt['title']}: {len(prompt['content'])} 字符")
-
+# 修改获取提示词的API端点
 @app.get("/api/prompts")
 async def get_prompts():
-    return {
-        "userPrompts": prompt_storage["users"].get("demo-user", []),
-        "defaultPrompts": prompt_storage["default"]
-    }
+    return JSONResponse({
+        "defaultPrompts": PREDEFINED_PROMPTS,  
+        "userPrompts": get_user_prompts_from_db()
+    })
 
 @app.middleware("http")
 async def validate_api_key(request: Request, call_next):
@@ -916,13 +903,6 @@ async def validate_api_key(request: Request, call_next):
             headers={"Access-Control-Allow-Origin": "*"}
         )
     return await call_next(request)
-
-@app.post("/api/prompts")
-async def create_prompt(request_data: PromptCreate = Body(...)):
-    logger.info("进入create_prompt路由处理")
-    logger.debug(f"请求头: {request.headers}")
-    print(f"收到请求数据: {request_data.dict()}")
-    return {"test": "ok"}
 
 class ExecutionRequest(BaseModel):
     text: str
@@ -1027,52 +1007,28 @@ template_db = [
     {"id": "csr-01", "name": "CSR Brief", "category": "csr"}
 ]
 
-@app.get("/api/sources", response_model=List[Source])
-async def get_sources():
-    """Get list of all documents"""
+@app.get("/api/sources")
+async def get_all_sources():
     try:
-        sources = []
-        for doc_id, info in stored_files.items():
-            sources.append(Source(
-                id=doc_id,
-                name=info["original_name"],
-                size=str(os.path.getsize(info["path"])),
-                type="document",
-                origin="upload",
-                isTemplate=False
-            ))
-        
-        # Add template documents
-        template_docs = [
-            Source(
-                id="template1",
-                name="Main Protocol",
-                size="N/A",
-                type="document",
-                origin="system",
-                isTemplate=True
-            ),
-            Source(
-                id="template2",
-                name="CRO Final Report 2023",
-                size="N/A",
-                type="report",
-                origin="system",
-                isTemplate=True
-            ),
-            Source(
-                id="template3",
-                name="Lab Results Q4",
-                size="N/A",
-                type="lab",
-                origin="system",
-                isTemplate=True
-            )
+        document_files = glob.glob(os.path.join(UPLOAD_DIR, "*"))
+        return [
+            {
+                "id": os.path.splitext(os.path.basename(f))[0],  # 使用文件名作为ID
+                "name": os.path.basename(f),  # 返回实际文件名
+                "type": "document",
+                "origin": "upload",
+                "size": str(os.path.getsize(f)),
+                "uploadDate": datetime.fromtimestamp(
+                    os.path.getctime(f)
+                ).isoformat(),
+                "vectorized": True,
+                "analyzed": False
+            }
+            for f in document_files
+            if not os.path.basename(f).startswith('.')  # 排除隐藏文件
         ]
-        
-        return sources + template_docs
     except Exception as e:
-        logger.error(f"Failed to get sources: {str(e)}")
+        logger.error(f"获取文档列表失败: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/templates", response_model=List[Template])
@@ -1097,120 +1053,98 @@ class VisualizationRequest(BaseModel):
 dataset_storage = {}
 
 @app.post("/api/datasets/upload")
-async def upload_dataset(file: UploadFile = File(...)):
+async def upload_dataset(file: UploadFile):
     try:
         logger.info(f"Received dataset upload: {file.filename}")
+        content = await file.read()
+        logger.info(f"File content read: {len(content)} bytes")
         
-        # 检查文件类型
-        valid_extensions = ('.csv', '.xlsx', '.xls')
-        if not file.filename.lower().endswith(valid_extensions):
-            logger.error(f"Invalid file type: {file.filename}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Only {', '.join(valid_extensions)} files are supported"
-            )
+        # 使用 pandas 读取 CSV，添加数据类型处理
+        df = pd.read_csv(
+            io.StringIO(content.decode('utf-8')),
+            low_memory=False,  # 防止混合类型警告
+            na_values=['NA', 'N/A', ''],  # 处理缺失值
+            dtype_backend='numpy_nullable'  # 使用新的 dtype 后端处理混合类型
+        )
         
-        # 读取文件内容
-        try:
-            content = await file.read()
-            logger.info(f"File content read: {len(content)} bytes")
-        except Exception as e:
-            logger.error(f"Failed to read file: {str(e)}")
-            raise HTTPException(status_code=500, detail="Failed to read file")
-        
-        try:
-            # 根据文件类型处理数据
-            file_ext = os.path.splitext(file.filename.lower())[1]
-            if file_ext == '.csv':
-                df = pd.read_csv(io.StringIO(content.decode('utf-8')))
-            elif file_ext in ('.xlsx', '.xls'):
-                df = pd.read_excel(io.BytesIO(content))
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unsupported file format"
-                )
-                
-            logger.info(f"Dataset loaded: {len(df)} rows, {len(df.columns)} columns")
-            
-            # 获取列名和预览数据
-            columns = df.columns.tolist()
-            preview = df.head(5).to_dict('records')
-            
-            return {
-                "status": "success",
-                "columns": columns,
-                "preview": preview
-            }
-            
-        except Exception as e:
-            logger.error(f"Failed to process dataset: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to process dataset: {str(e)}"
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # 处理无限和非法浮点数值
+        for column in df.select_dtypes(include=['float64']).columns:
+            # 将无限值替换为 NaN
+            df[column] = df[column].replace([np.inf, -np.inf], np.nan)
+            # 将 NaN 替换为 None (会被转换为 JSON 中的 null)
+            df[column] = df[column].where(pd.notnull(df[column]), None)
 
-@app.post("/api/generate-visualization")
-async def generate_visualization(request: VisualizationRequest):
-    try:
-        logger.info(f"Generating visualization with config: {request.config}")
+        logger.info(f"Dataset loaded: {len(df)} rows, {len(df.columns)} columns")
         
-        # 将数据转换为 DataFrame
-        df = pd.DataFrame(request.dataset.data)
-        
-        # 创建图表
-        plt.figure(figsize=(10, 6))
-        plt.clf()  # 清除之前的图表
-        
-        if request.config.chartType == 'bar':
-            df.plot(
-                kind='bar',
-                x=request.config.xAxis,
-                y=request.config.yAxis
-            )
-        elif request.config.chartType == 'line':
-            df.plot(
-                kind='line',
-                x=request.config.xAxis,
-                y=request.config.yAxis
-            )
-        elif request.config.chartType == 'scatter':
-            df.plot(
-                kind='scatter',
-                x=request.config.xAxis,
-                y=request.config.yAxis
-            )
-        elif request.config.chartType == 'pie':
-            df[request.config.yAxis].plot(kind='pie')
-        
-        plt.title(f"{request.config.chartType.capitalize()} Chart")
-        plt.xlabel(request.config.xAxis)
-        plt.ylabel(request.config.yAxis)
-        
-        # 保存图表为 base64 字符串
-        buffer = io.BytesIO()
-        plt.savefig(buffer, format='png')
-        buffer.seek(0)
-        image_base64 = base64.b64encode(buffer.getvalue()).decode()
-        
-        logger.info("Visualization generated successfully")
+        # 确保返回正确的列信息和数据格式
         return {
-            "status": "success",
-            "image": image_base64
+            "message": "Dataset uploaded successfully",
+            "rows": len(df),
+            "columns": df.columns.tolist(),  # 返回列名列表
+            "data": df.head(100).to_dict('records'),  # 返回前100行数据
+            "preview": df.head(5).to_dict('records')  # 返回前5行预览
         }
         
     except Exception as e:
-        logger.error(f"Failed to generate visualization: {str(e)}")
+        logger.error(f"Dataset upload failed: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate visualization: {str(e)}"
+            detail=f"Failed to process dataset: {str(e)}"
         )
+
+@app.post("/api/generate-visualization")
+async def generate_visualization(config: dict):
+    try:
+        logger.info(f"Generating visualization with config: {config}")
+        
+        # 获取当前数据集
+        df = pd.DataFrame(current_dataset)
+        
+        # 验证数据列
+        x_col = config.get('xAxis')
+        y_col = config.get('yAxis')
+        chart_type = config.get('chartType', 'bar')
+        
+        if not x_col or not y_col:
+            raise HTTPException(status_code=400, detail="Missing axis configuration")
+            
+        # 自动转换数值类型
+        if not np.issubdtype(df[y_col].dtype, np.number):
+            try:
+                df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
+                df = df.dropna(subset=[y_col])
+                if df.empty:
+                    raise ValueError("No valid numeric data after conversion")
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Column {y_col} cannot be converted to numeric values"
+                )
+        
+        # 生成图表
+        plt.figure(figsize=(10, 6))
+        if chart_type == 'bar':
+            df.plot.bar(x=x_col, y=y_col, ax=plt.gca())
+        elif chart_type == 'line':
+            df.plot.line(x=x_col, y=y_col, ax=plt.gca())
+        elif chart_type == 'pie':
+            df[y_col].value_counts().plot.pie(autopct='%1.1f%%', ax=plt.gca())
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported chart type")
+            
+        # 保存图表
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', bbox_inches='tight')
+        plt.close()
+        img_buffer.seek(0)
+        
+        return StreamingResponse(img_buffer, media_type="image/png")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate visualization: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 chat_router = APIRouter()
 
@@ -1250,7 +1184,10 @@ async def chat_with_word(request: ChatRequest):
         chunks = text_splitter.split_text(request.document_text)
         
         # 创建临时向量库
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-mpnet-base-v2",
+            model_kwargs={'device': 'mps'}  # 使用M1/M2 Mac的MPS加速
+        )
         vectorstore = FAISS.from_texts(chunks, embeddings)
 
         # 构建对话链
@@ -1309,85 +1246,108 @@ def save_files_db(files_db):
 # 初始化文件数据库
 stored_files = load_files_db()
 
+def process_document(file_path: str):
+    # 根据文件类型选择加载器
+    if file_path.endswith('.pdf'):
+        loader = PyPDFLoader(file_path)
+    elif file_path.endswith('.docx'):
+        loader = Docx2txtLoader(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
+    documents = loader.load()
+    
+    # 文本分块
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+    chunks = text_splitter.split_documents(documents)
+    
+    # 生成向量存储
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-mpnet-base-v2",
+        model_kwargs={'device': 'mps'}
+    )
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    
+    # 保存时确保设置正确的序列化选项
+    vectorstore.save_local(
+        "vectorstore",
+        # 如果需要，可以添加其他序列化选项
+    )
+    
+    return chunks
+
 @app.post("/api/sources/upload")
 async def upload_document(file: UploadFile = File(...)):
     try:
-        logger.info(f"Starting upload for file: {file.filename}")
+        # 生成唯一ID但保留原始文件名
+        file_id = str(uuid.uuid4())
+        original_name = file.filename
+        file_ext = os.path.splitext(original_name)[1]
         
-        # Generate document ID
-        doc_id = str(uuid.uuid4())
-        logger.info(f"Generated new document ID: {doc_id}")
+        # 保存文件，使用原始文件名
+        file_path = os.path.join(UPLOAD_DIR, original_name)
         
-        # Create filename with ID prefix
-        file_extension = os.path.splitext(file.filename)[1]
-        storage_filename = f"{doc_id}{file_extension}"
-        file_path = os.path.join(UPLOAD_DIR, storage_filename)
-        
-        # Read and save file
-        content = await file.read()
+        # 如果文件名已存在，添加数字后缀
+        base_name = os.path.splitext(original_name)[0]
+        counter = 1
+        while os.path.exists(file_path):
+            new_name = f"{base_name}_{counter}{file_ext}"
+            file_path = os.path.join(UPLOAD_DIR, new_name)
+            counter += 1
+            
         with open(file_path, "wb") as buffer:
-            buffer.write(content)
-        logger.info(f"File saved as: {storage_filename}")
-        
-        # Store file info
-        logger.info(f"Current stored_files before update: {stored_files}")
-        stored_files[doc_id] = {
-            "filename": storage_filename,
-            "original_name": file.filename,
-            "path": file_path
-        }
-        logger.info(f"Updated stored_files: {stored_files}")
-        
-        # Update and persist file info
-        save_files_db(stored_files)
-        logger.info("File info saved to database")
-        
+            shutil.copyfileobj(file.file, buffer)
+            
         return {
-            "status": "success",
-            "document": Source(
-                id=doc_id,
-                name=file.filename,
-                size=str(len(content)),
-                type="document",
-                origin="upload",
-                isTemplate=False,
-                summary=""
-            ).dict()
+            "document": {
+                "id": file_id,
+                "name": os.path.basename(file_path),
+                "type": "document",
+                "origin": "upload",
+                "size": str(os.path.getsize(file_path)),
+                "uploadDate": datetime.now().isoformat(),
+                "vectorized": False,  # 初始上传时为false
+                "analyzed": False     # 初始上传时为false
+            }
         }
-        
     except Exception as e:
         logger.error(f"Upload failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/sources/{doc_id}")
-async def delete_document(doc_id: str):
+async def delete_source(doc_id: str):
     try:
-        logger.info(f"Attempting to delete document: {doc_id}")
-        logger.info(f"Current stored_files: {stored_files}")
+        # 检查文件是否存在
+        doc_path = os.path.join(UPLOAD_DIR, f"{doc_id}.*")
+        files = glob.glob(doc_path)
         
-        file_info = stored_files.get(doc_id)
-        if not file_info:
-            logger.error(f"No file info found for id: {doc_id}")
-            raise HTTPException(status_code=404, detail="Document not found")
+        if not files:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found in uploads directory"
+            )
+            
+        # 删除物理文件
+        for file_path in files:
+            try:
+                os.remove(file_path)
+                logger.info(f"Deleted file: {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to delete file {file_path}: {str(e)}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to delete file: {str(e)}"
+                )
         
-        file_path = file_info["path"]
-        logger.info(f"Found file path: {file_path}")
+        return {"status": "success"}
         
-        if not os.path.exists(file_path):
-            logger.error(f"File not found at path: {file_path}")
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        os.remove(file_path)
-        del stored_files[doc_id]
-        save_files_db(stored_files)
-        logger.info(f"File deleted and database updated. Remaining files: {stored_files}")
-        
-        return {"status": "success", "message": "Document deleted successfully"}
-        
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        logger.error(f"Unexpected error while deleting document {doc_id}: {str(e)}")
+        logger.error(f"Delete error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def is_template_document(doc_id: str) -> bool:
@@ -1408,18 +1368,138 @@ async def validation_exception_handler(request, exc):
 # 在FastAPI app创建后初始化数据库
 init_db()
 
-if __name__ == "__main__":
-    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_context.load_cert_chain(
-        certfile="localhost.crt",  
-        keyfile="localhost.key"    
-    )
+@app.post("/api/analyze")
+async def analyze_documents(request: Request):
+    data = await request.json()
+    doc_ids = data.get("docIds", [])
     
+    try:
+        response = {
+            "documents": []
+        }
+        
+        for doc_id in doc_ids:
+            doc_path = os.path.join(UPLOAD_DIR, f"{doc_id}.*")
+            files = glob.glob(doc_path)
+            if files:
+                file_path = files[0]
+                # 在这里进行向量化处理
+                # ...
+                
+                response["documents"].append({
+                    "id": doc_id,
+                    "name": os.path.basename(file_path),
+                    "type": "document",
+                    "origin": "upload",
+                    "size": str(os.path.getsize(file_path)),
+                    "uploadDate": datetime.fromtimestamp(
+                        os.path.getctime(file_path)
+                    ).isoformat(),
+                    "vectorized": True,   # 分析后设置为true
+                    "analyzed": True      # 分析后设置为true
+                })
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"分析文档时出错: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def init_uploaded_files():
+    """启动时加载已上传文件"""
+    UPLOAD_DIR = "uploads"
+    if not os.path.exists(UPLOAD_DIR):
+        return []
+    
+    return [
+        {
+            "id": os.path.splitext(f)[0],  # 使用文件名作为ID
+            "name": f,
+            "type": "document",
+            "origin": "upload",
+            "uploadDate": datetime.fromtimestamp(
+                os.path.getctime(os.path.join(UPLOAD_DIR, f))
+            ).isoformat()
+        }
+        for f in os.listdir(UPLOAD_DIR)
+    ]
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    # 确保上传目录存在
+    UPLOAD_DIR = "uploads"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    logger.info("✅ 服务启动完成")
+    logger.info(f"当前工作目录：{os.getcwd()}")
+    logger.info(f"上传目录内容：{os.listdir(UPLOAD_DIR)}")
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"收到请求: {request.method} {request.url}")
+    try:
+        response = await call_next(request)
+        logger.info(f"返回响应: {response.status_code}")
+        return response
+    except Exception as e:
+        logger.error(f"请求处理失败: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"message": "Internal server error"}
+        )
+
+def sanitize_xml(text: str) -> str:
+    # 移除控制字符（ASCII 0-31，除了换行和制表符）
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # 替换非法XML字符
+    return cleaned.encode('utf-8', 'ignore').decode('utf-8')
+
+@app.post("/api/export-chat")
+async def export_chat(request: Request):
+    try:
+        logger.info("开始处理导出请求")
+        data = await request.json()
+        # 清洗文档内容
+        doc_text = sanitize_xml(data.get('documentText', 'No document content'))
+        
+        # 创建文档
+        doc = Document()
+        doc.add_heading('Chat Export', 0)
+        
+        # 添加聊天记录（清洗每条消息）
+        for msg in data['messages']:
+            role = "User" if msg.get('isUser') else "AI"
+            content = sanitize_xml(msg.get('content', 'No content'))
+            doc.add_paragraph(f"{role}: {content}")
+        
+        # 添加文档内容
+        if doc_text.strip():
+            doc.add_heading('Current Document', 1)
+            doc.add_paragraph(doc_text)
+        
+        # 保存文件
+        filename = f"ChatExport_{datetime.now().strftime('%Y%m%d%H%M%S')}.docx"
+        export_path = os.path.join(EXPORT_DIR, filename)
+        doc.save(export_path)
+        
+        logger.info(f"文件已保存到：{export_path}")
+        return FileResponse(export_path, filename=filename)
+    except Exception as e:
+        logger.error(f"导出失败详情：{traceback.format_exc()}")
+        raise HTTPException(500, "导出失败，请检查日志")
+
+EXPORT_DIR = "exports"
+if not os.path.exists(EXPORT_DIR):
+    os.makedirs(EXPORT_DIR)
+
+if __name__ == "__main__":
     uvicorn.run(
-        "main:app", 
-        host="0.0.0.0", 
-        port=8000, 
+        "main:app",
+        host="0.0.0.0",  # 改为0.0.0.0而不是localhost
+        port=8000,
         reload=True,
-        ssl_certfile="localhost.crt",
-        ssl_keyfile="localhost.key"
+        # 暂时禁用SSL
+        # ssl_keyfile="./key.pem",
+        # ssl_certfile="./cert.pem",
+        log_level="debug"  # 添加详细日志
     ) 

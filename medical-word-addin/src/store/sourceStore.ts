@@ -11,6 +11,7 @@ interface Source {
   uploadDate: string;
   size: string;
   vectorized: boolean;
+  analyzed: boolean;
   isTemplate?: boolean;
 }
 
@@ -21,10 +22,10 @@ interface Template {
 }
 
 interface SourceState {
-  selectedSources: string[];
-  selectedTemplates: Template[];
   availableSources: Source[];
-  availableTemplates: Template[];
+  availableTemplates: Source[];
+  selectedSources: string[];
+  selectedTemplates: string[];
   addSource: (source: Source) => void;
   removeSource: (id: string) => void;
   toggleSource: (id: string) => void;
@@ -32,57 +33,72 @@ interface SourceState {
   loadSources: () => Promise<void>;
   loadTemplates: () => Promise<void>;
   vectorizeSource: (id: string) => Promise<void>;
+  setAvailableSources: (sources: Source[]) => void;
 }
 
-export const useSourceStore = create(
-  persist<SourceState>(
+const useSourceStore = create<SourceState>()(
+  persist(
     (set) => ({
-      selectedSources: [],
-      selectedTemplates: [],
       availableSources: [],
       availableTemplates: [],
-      addSource: (source) => set((state) => ({
-        availableSources: [...state.availableSources, source]
-      })),
-      removeSource: (id) => set((state) => {
-        const source = state.availableSources.find(s => s.id === id);
-        if (source?.isTemplate) {
-          return state;
-        }
-        return {
+      selectedSources: [],
+      selectedTemplates: [],
+      
+      addSource: (source: Source) => {
+        set(state => {
+          const existingIndex = state.availableSources.findIndex(s => s.id === source.id);
+          const newSources = existingIndex >= 0 
+            ? state.availableSources.map((s, i) => i === existingIndex ? { ...s, ...source } : s)
+            : [...state.availableSources, source];
+          return { availableSources: newSources };
+        });
+      },
+      
+      removeSource: (id: string) => {
+        set(state => ({
           availableSources: state.availableSources.filter(s => s.id !== id),
           selectedSources: state.selectedSources.filter(s => s !== id)
-        };
-      }),
-      toggleSource: (id) => set((state) => ({
-        selectedSources: state.selectedSources.includes(id)
-          ? state.selectedSources.filter(s => s !== id)
-          : [...state.selectedSources, id]
-      })),
-      selectTemplate: (template) => set({ selectedTemplates: [template] }),
+        }));
+      },
+      
       loadSources: async () => {
         try {
-          const sources = await getSources();
-          // 定义模板文档的名称列表
-          const templateNames = [
-            'Main Protocol',
-            'CRO Final Report 2023',
-            'Lab Results Q4'
-          ];
-          const sourcesWithTemplates = sources.map(source => ({
-            ...source,
-            isTemplate: templateNames.includes(source.name)
+          // 强制从后端获取最新文档列表
+          const serverSources = await getSources();
+          
+          set(state => ({
+            // 完全使用服务器数据，覆盖本地缓存
+            availableSources: serverSources.map(serverDoc => ({
+              ...serverDoc,
+              // 仅保留服务器没有的本地状态
+              analyzed: state.availableSources.find(local => local.id === serverDoc.id)?.analyzed || false
+            }))
           }));
-          set({ availableSources: sourcesWithTemplates });
         } catch (error) {
           console.error('Failed to load sources:', error);
         }
       },
+      
+      toggleSource: (id: string) => set((state) => ({
+        selectedSources: state.selectedSources.includes(id)
+          ? state.selectedSources.filter(s => s !== id)
+          : [...state.selectedSources, id]
+      })),
+      
+      selectTemplate: (template: Template) => set({ selectedTemplates: [template] }),
+      
+      setAvailableSources: (sources: Source[]) => set({ 
+        availableSources: sources,
+        // 清理选中状态
+        selectedSources: []  // 重置选中状态
+      }),
+      
       loadTemplates: async () => {
         const templates = await getTemplates();
         set({ availableTemplates: templates });
       },
-      vectorizeSource: async (id) => {
+      
+      vectorizeSource: async (id: string) => {
         try {
           await getSources();
           set((state) => ({
@@ -97,7 +113,13 @@ export const useSourceStore = create(
     }),
     {
       name: 'source-storage',
-      getStorage: () => localStorage
+      getStorage: () => localStorage,
+      // 添加迁移策略清除旧数据
+      migrate: (persistedState) => {
+        return { ...persistedState, availableSources: [] }
+      }
     }
   )
-); 
+);
+
+export { useSourceStore }; 

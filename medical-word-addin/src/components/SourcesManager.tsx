@@ -1,11 +1,12 @@
 import * as React from 'react';
-import { Stack, Label, Toggle, ChoiceGroup, PrimaryButton, DetailsList, SelectionMode, MessageBar, MessageBarType, IconButton, DefaultButton, Text } from '@fluentui/react';
+import { Stack, Label, Toggle, ChoiceGroup, PrimaryButton, DetailsList, SelectionMode, MessageBar, MessageBarType, IconButton, DefaultButton, Text, Checkbox } from '@fluentui/react';
 import { useSourceStore } from '../store/sourceStore';
 import { api } from '../services/api';
 import Word from '/Users/roboticssn/Documents/code/project/chatbot/medical-word-addin/src/services/word';
 import { v4 as uuidv4 } from 'uuid';
 import { Icon } from '@fluentui/react';
 import { StatusIndicator } from './StatusIndicator';
+import Office from 'office-js';
 
 interface DocumentItem {
   id: string;
@@ -17,6 +18,7 @@ interface DocumentItem {
   progress?: number;
   vectorized?: boolean;
   isTemplate?: boolean;
+  analyzed?: boolean;
 }
 
 export const SourcesManager: React.FC = () => {
@@ -30,122 +32,170 @@ export const SourcesManager: React.FC = () => {
     loadSources,
     loadTemplates,
     addSource,
-    removeSource
+    removeSource,
+    setAvailableSources
   } = useSourceStore();
 
   const [uploadingDocs, setUploadingDocs] = React.useState<DocumentItem[]>([]);
   const [selectedDocs, setSelectedDocs] = React.useState<string[]>([]);
   const [error, setError] = React.useState<string | null>(null);
+  const [analyzing, setAnalyzing] = React.useState(false);
+
+  // 组件挂载时强制同步
+  React.useEffect(() => {
+    const initialize = async () => {
+      await loadSources();  // 首次加载
+      await new Promise(resolve => setTimeout(resolve, 1000)); // 等待1秒
+      await loadSources();  // 二次确认
+    };
+    initialize();
+  }, [loadSources]);
+
+  // 添加文件监听
+  React.useEffect(() => {
+    const handler = () => loadSources();
+    
+    // 每5秒同步一次
+    const timer = setInterval(handler, 5000);
+    
+    // 监听窗口焦点事件
+    window.addEventListener('focus', handler);
+    
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', handler);
+    };
+  }, [loadSources]);
 
   React.useEffect(() => {
-    loadSources();
     loadTemplates();
   }, []);
 
-  const handleUpload = async (files: FileList) => {
-    setError(null);
-    const maxFileSize = 50 * 1024 * 1024; // 50MB
+  // 定期同步文档列表
+  React.useEffect(() => {
+    loadSources(); // 初始加载
     
+    const syncInterval = setInterval(() => {
+      loadSources();
+    }, 30000); // 每30秒同步一次
+    
+    return () => clearInterval(syncInterval);
+  }, [loadSources]);
+
+  const handleUpload = async (files: FileList) => {
+    console.log('[DEBUG] 开始上传文件数量:', files.length);
+    
+    setError(null);
+    
+    const formData = new FormData();
     Array.from(files).forEach(file => {
-      // 添加文件大小检查
-      if (file.size > maxFileSize) {
-        setError(`File ${file.name} is too large. Maximum size is 50MB`);
-        return;
-      }
+      formData.append('file', file);
+    });
+
+    Array.from(files).forEach(async file => {
+      console.log('[DEBUG] 正在上传文件:', file.name);
       
       const tempId = uuidv4();
       
-      // 添加上传中状态
+      // 显示上传进度
       setUploadingDocs(prev => [...prev, {
         id: tempId,
         name: file.name,
-        uploadDate: new Date().toLocaleString(),
-        size: `${(file.size / 1024 / 1024).toFixed(2)} MB`,
         status: 'uploading',
         progress: 0
       }]);
 
-      const formData = new FormData();
-      formData.append('file', file);
+      try {
+        const response = await api.post('/api/sources/upload', formData, {
+          headers: {'Content-Type': 'multipart/form-data'},
+          onUploadProgress: progressEvent => {
+            const percent = Math.round(
+              (progressEvent.loaded * 100) / progressEvent.total
+            );
+            setUploadingDocs(prev => 
+              prev.map(doc => 
+                doc.id === tempId ? {...doc, progress: percent} : doc
+              )
+            );
+          }
+        });
+        
+        console.log('[DEBUG] 上传响应:', response.data);
+        addSource(response.data.document);
+        
+        // 强制刷新文档列表
+        const sources = await api.get('/api/sources');
+        console.log('[DEBUG] 刷新后的文档列表:', sources.data);
+        
+        setAvailableSources(sources.data);
 
-      api.uploadSourcesDocument(formData, {
-        onUploadProgress: (progressEvent) => {
-          const percent = Math.round(
-            (progressEvent.loaded * 100) / progressEvent.total
-          );
-          setUploadingDocs(prev => 
-            prev.map(doc => 
-              doc.id === tempId ? {...doc, progress: percent} : doc
-            )
-          );
-        }
-      })
-      .then(response => {
-        const newDoc = {
-          ...response.data.document,
-          id: tempId,
-          status: 'success',
-        };
-        setUploadingDocs(prev => prev.filter(doc => doc.id !== tempId));
-        addSource(newDoc);
-      })
-      .catch(error => {
-        console.error('Upload failed:', error);
-        const errorMessage = error.response?.data?.detail || error.message || 'Failed to upload file';
-        setError(`Failed to upload ${file.name}: ${errorMessage}`);
+        // 移除上传中状态
+        setUploadingDocs(prev => 
+          prev.filter(doc => doc.id !== tempId)
+        );
+
+      } catch (error) {
         setUploadingDocs(prev =>
           prev.map(doc => 
             doc.id === tempId ? {...doc, status: 'error'} : doc
           )
         );
-      });
+        console.error('[ERROR] 上传失败:', error);
+      }
     });
   };
 
-  // 文档分析
-  const analyzeDocuments = async () => {
-    const docIds = selectedDocs.map(id => 
-      uploadingDocs.find(d => d.id === id)?.id
-    ).filter(Boolean);
-
-    const analysis = await api.analyzeSources({
-      docIds,
-      instruction: "生成新药临床研究综合报告"
-    });
+  const handleAnalyze = async () => {
+    if (selectedDocs.length === 0) return;
     
-    // 插入Word文档
-    Word.run(context => {
-      const range = context.document.getSelection();
-      range.insertText(analysis.summary, 'Replace');
-      return context.sync();
-    });
+    setAnalyzing(true);
+    try {
+        const response = await api.post('/api/analyze', {
+            docIds: selectedDocs,
+            instruction: "请分析这些文档的内容"
+        });
+        
+        // 更新每个文档的状态
+        response.data.documents.forEach((doc: Source) => {
+            addSource({
+                ...doc,
+                vectorized: true,
+                analyzed: true
+            });
+        });
+        
+        // 显示成功消息
+        Office.context.ui.displayDialogAsync(
+            'data:text/plain,' + encodeURIComponent('文档分析完成'),
+            { height: 60, width: 300 }
+        );
+    } catch (error) {
+        console.error('Analysis failed:', error);
+        Office.context.ui.displayDialogAsync(
+            'data:text/plain,' + encodeURIComponent(`分析失败: ${error.message}`),
+            { height: 60, width: 300 }
+        );
+    } finally {
+        setAnalyzing(false);
+    }
   };
 
   const handleDelete = async (docId: string) => {
     try {
-      // Check if document is a template
-      const doc = availableSources.find(s => s.id === docId);
-      if (doc?.isTemplate) {
-        setError("Template documents cannot be deleted");
-        return;
-      }
-
-      // Show loading state
-      setError(null);
-      
-      // Call API to delete the document
-      await api.deleteSource(docId);
-      
-      // Only remove from store if API call succeeds
+      await api.delete(`/api/sources/${docId}`);
       removeSource(docId);
-      
-    } catch (error) {
+      await loadSources();
+    } catch (error: any) {
       console.error('Delete error:', error);
-      setError(
-        error.response?.data?.detail || 
-        error.message || 
-        "Failed to delete document"
-      );
+      if (error.response?.status === 404) {
+        removeSource(docId);
+        await loadSources();
+      } else {
+        Office.context.ui.displayDialogAsync(
+          'data:text/plain,' + encodeURIComponent(`删除失败: ${error.message}`),
+          { height: 60, width: 300 }
+        );
+      }
     }
   };
 
@@ -157,6 +207,87 @@ export const SourcesManager: React.FC = () => {
       status: 'success' as const
     }))
   ];
+
+  // 在loadSources调用后添加调试日志
+  const loadAndLogSources = async () => {
+    await loadSources();
+    console.log('当前文档列表:', availableSources);
+  }
+
+  // 修改useEffect
+  React.useEffect(() => {
+    loadAndLogSources();
+    const interval = setInterval(loadAndLogSources, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // 修改列定义
+  const columns = [
+    { 
+      key: 'status', 
+      name: '', 
+      minWidth: 40,
+      maxWidth: 40,
+      onRender: (item: DocumentItem) => 
+        item.status === 'uploading' ? (
+          <StatusIndicator 
+            status="uploading" 
+            progress={item.progress} 
+          />
+        ) : (
+          <StatusIndicator 
+            status="success"
+            analyzed={item.analyzed}
+            selected={selectedDocs.includes(item.id)}
+            onClick={() => {
+              if (item.status !== 'uploading') {
+                if (selectedDocs.includes(item.id)) {
+                  setSelectedDocs(selectedDocs.filter(id => id !== item.id));
+                } else {
+                  setSelectedDocs([...selectedDocs, item.id]);
+                }
+              }
+            }}
+          />
+        )
+    },
+    { 
+      key: 'name', 
+      name: 'Document Name', 
+      minWidth: 150,
+      onRender: (item: DocumentItem) => (
+        <Text>{item.name}</Text>
+      )
+    },
+    {
+      key: 'delete',
+      name: 'Actions',
+      minWidth: 70,
+      onRender: (item: DocumentItem) => {
+        return item.isTemplate ? null : (
+          <DefaultButton
+            text="Delete"
+            onClick={() => handleDelete(item.id)}
+            styles={{
+              root: {
+                backgroundColor: '#d13438',
+                color: 'white',
+                minWidth: 60,
+                padding: '5px 10px'
+              },
+              rootHovered: {
+                backgroundColor: '#a4262c',
+                color: 'white'
+              }
+            }}
+          />
+        );
+      }
+    }
+  ];
+
+  // 移除 select 列
+  const columnsWithoutSelect = columns.filter(col => col.key !== 'select');
 
   return (
     <Stack tokens={{ childrenGap: 15 }}>
@@ -191,76 +322,71 @@ export const SourcesManager: React.FC = () => {
       </Text>
       <DetailsList
         items={allDocuments}
-        columns={[
-          { 
-            key: 'name', 
-            name: 'Document Name', 
-            minWidth: 150,
-            onRender: (item: DocumentItem) => (
-              <Text>{item.name}</Text>
-            )
-          },
-          { 
-            key: 'size', 
-            name: 'Size', 
-            minWidth: 80,
-            onRender: (item: DocumentItem) => (
-              <Text>{item.size}</Text>
-            )
-          },
-          { 
-            key: 'status', 
-            name: 'Status', 
-            onRender: (item) => 
-              item.status === 'uploading' ? (
-                <StatusIndicator status="uploading" progress={item.progress} />
-              ) : (
-                <StatusIndicator status="success" />
-              )
-          },
-          { 
-            key: 'summary', 
-            name: 'AI Summary', 
-            minWidth: 300,
-            onRender: (item: DocumentItem) => (
-              <Text>{item.summary || 'No summary available'}</Text>
-            )
-          },
-          {
-            key: 'delete',
-            name: 'Actions',
-            minWidth: 70,
-            onRender: (item: DocumentItem) => {
-              return item.isTemplate ? null : (
-                <DefaultButton
-                  text="Delete"
-                  onClick={() => handleDelete(item.id)}
-                  styles={{
-                    root: {
-                      backgroundColor: '#d13438',
-                      color: 'white',
-                      minWidth: 60,
-                      padding: '5px 10px'
-                    },
-                    rootHovered: {
-                      backgroundColor: '#a4262c',
-                      color: 'white'
-                    }
-                  }}
-                />
-              );
-            }
+        columns={columnsWithoutSelect}
+        selectionMode={SelectionMode.none}
+        styles={{
+          root: {
+            overflowY: 'auto',
+            height: '400px'
           }
-        ]}
-        selectionMode={SelectionMode.multiple}
-        onSelectionChange={setSelectedDocs}
+        }}
       />
 
-      <PrimaryButton 
-        text="Analyze Documents" 
-        onClick={analyzeDocuments}
-        disabled={selectedDocs.length === 0}
-      />
+      {/* 分析按钮 */}
+      <Stack horizontal tokens={{ childrenGap: 10 }}>
+        <PrimaryButton
+          text="Analyze Documents"
+          disabled={selectedDocs.length === 0 || analyzing}
+          onClick={handleAnalyze}
+          styles={{
+            root: {
+              backgroundColor: selectedDocs.length > 0 ? '#0078d4' : '#f3f2f1'
+            }
+          }}
+        />
+      </Stack>
     </Stack>
+  );
+};
+
+export const StatusIndicator: React.FC<{
+  status: 'uploading' | 'success' | 'error';
+  progress?: number;
+  analyzed?: boolean;
+  selected?: boolean;
+  onClick?: () => void;
+}> = ({ status, progress, analyzed, selected, onClick }) => {
+  const getStatusColor = () => {
+    if (status === 'error') return '#d13438';
+    if (status === 'uploading') return '#0078d4';
+    if (selected) return '#0078d4';  // 选中状态改为蓝色
+    if (analyzed) return '#666';      // 已分析为灰色
+    return '#c8c8c8';                // 未分析为浅灰色
+  };
+
+  return (
+    <div 
+      onClick={onClick}
+      style={{
+        cursor: status === 'uploading' ? 'default' : 'pointer',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center', // 居中对齐
+        width: '100%', // 占满列宽
+        gap: '8px'
+      }}
+    >
+      <div style={{
+        width: '16px', // 增大圆点尺寸
+        height: '16px',
+        borderRadius: '50%',
+        backgroundColor: getStatusColor(),
+        transition: 'background-color 0.2s',
+        border: '1px solid #e0e0e0' // 添加边框使圆点更明显
+      }} />
+      {status === 'uploading' && progress !== undefined && (
+        <Text>{progress}%</Text>
+      )}
+    </div>
   );
 }; 

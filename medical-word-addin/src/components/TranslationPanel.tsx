@@ -501,7 +501,7 @@ export const TranslationPanel: React.FC = () => {
         {/* Logo */}
         <Stack.Item align="center">
           <img 
-            src="/assets/logo1.svg" 
+            src="/assets/DoubleBridge.png" 
             alt="DoubleBridge Logo" 
             style={{
               height: '50px',
