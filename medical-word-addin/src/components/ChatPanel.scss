@@ -1,0 +1,49 @@
+// 添加下拉菜单样式
+.ms-Dropdown-container {
+  .ms-Dropdown-title {
+    background-color: #fff;
+    transition: all 0.2s ease;
+    font-weight: 500;  // 稍微加粗
+    
+    &:hover {
+      background-color: #f8f9fa;
+      border-color: #0078d4;
+    }
+  }
+  
+  .ms-Dropdown-item {
+    padding: 0 12px;  // 调整内边距
+    font-size: 14px;  // 统一字体大小
+    height: 32px;     // 固定高度
+    line-height: 32px; // 文字垂直居中
+    
+    &:hover {
+      background-color: #f0f6ff;
+    }
+  }
+  
+  .ms-Dropdown-itemSelected {
+    background-color: #e1efff;
+    font-weight: 500;  // 选中项加粗
+    
+    &:hover {
+      background-color: #e1efff;
+    }
+  }
+}
+
+// 添加云模式标签动画
+.cloud-mode-label {
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+} 
