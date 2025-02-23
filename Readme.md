@@ -19,6 +19,7 @@ pip install -r requirements.txt
 
 ## SSL Certificate Setup:
 npx office-addin-dev-certs install // Install Office Add-in Dev Certificates
+
 openssl req -x509 -newkey rsa:2048 -keyout localhost.key -out localhost.crt -days 365 -nodes // Generate SSL certificate for backend
 
 ## Backend Setup:
