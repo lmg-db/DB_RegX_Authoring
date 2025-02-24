@@ -47,6 +47,11 @@ import glob
 from pathlib import Path
 import shutil
 import numpy as np
+from azure_model_service import azure_service, get_azure_service
+from langchain.chat_models import AzureChatOpenAI
+from auth import get_current_user, User  # 显式导入User类
+from fastapi.security import OAuth2PasswordBearer
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 logging.basicConfig(
     level=logging.DEBUG,  # 显示更详细日志
@@ -731,6 +736,17 @@ async def generate_text(request: TextGenerationRequest):
         
         prompt = template.format(text=request.text)
         
+        try:
+            # 尝试使用MPS加速
+            model = load_local_model('mistral', device='mps')
+        except RuntimeError as e:
+            if 'MPS not available' in str(e):
+                # 回退到CPU
+                model = load_local_model('mistral', device='cpu')
+                logger.warning("MPS不可用，已回退到CPU模式")
+            else:
+                raise
+        
         response = model(prompt)
         
         return TextGenerationResponse(
@@ -1156,11 +1172,16 @@ class ChatRequest(BaseModel):
     question: str
     document_text: str
     history: List[ChatMessage]
+    model: str = "local"
 
 @app.post("/api/chat/word")
 async def chat_with_word(request: ChatRequest):
     try:
         logger.info(f"[Chat] Processing request with history length: {len(request.history)}")
+        
+        # 模型选择逻辑
+        use_cloud = request.model == "azure"
+        logger.info(f"Using {'Azure' if use_cloud else 'local'} model: {request.model}")
         
         if not request.history:
             logger.info("[Chat] No history provided, starting new conversation")
@@ -1190,14 +1211,28 @@ async def chat_with_word(request: ChatRequest):
         )
         vectorstore = FAISS.from_texts(chunks, embeddings)
 
-        # 构建对话链
-        qa = ConversationalRetrievalChain.from_llm(
-            llm=mistral,
-            retriever=vectorstore.as_retriever(),
-            return_source_documents=True
-        )
-        
-        # 执行对话
+        # 模型选择核心逻辑
+        if use_cloud:
+            # 使用Azure云服务
+            service = await get_azure_service()
+            qa = ConversationalRetrievalChain.from_llm(
+                llm=AzureChatOpenAI(
+                    azure_deployment=os.getenv("AZURE_ENGINE"),
+                    openai_api_version=os.getenv("AZURE_API_VERSION")
+                ),
+                retriever=vectorstore.as_retriever(),
+                return_source_documents=True
+            )
+        else:
+            # 本地模型选择
+            local_model = llama if request.model == "llama" else mistral
+            qa = ConversationalRetrievalChain.from_llm(
+                llm=local_model,
+                retriever=vectorstore.as_retriever(),
+                return_source_documents=True
+            )
+
+        # 执行对话（保持原有逻辑）
         result = await qa.ainvoke({
             "question": request.question,
             "chat_history": formatted_history,
@@ -1426,6 +1461,8 @@ def init_uploaded_files():
 
 @app.on_event("startup")
 async def startup_event():
+    if os.getenv("USE_CLOUD_MODELS", "false").lower() == "true":
+        await azure_service.initialize()
     init_db()
     # 确保上传目录存在
     UPLOAD_DIR = "uploads"
@@ -1491,6 +1528,26 @@ async def export_chat(request: Request):
 EXPORT_DIR = "exports"
 if not os.path.exists(EXPORT_DIR):
     os.makedirs(EXPORT_DIR)
+
+@app.post("/api/switch-model")
+async def switch_model(
+    use_cloud: bool = Body(..., embed=True),
+    current_user: User = Depends(get_current_user)
+):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Requires admin privileges")
+    
+    try:
+        if use_cloud:
+            await azure_service.initialize()
+        # 可以在这里添加本地模型的关闭逻辑
+        return {"status": "success", "using_cloud": use_cloud}
+    except Exception as e:
+        logger.error(f"Model switch failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to switch model mode: {str(e)}"
+        )
 
 if __name__ == "__main__":
     uvicorn.run(

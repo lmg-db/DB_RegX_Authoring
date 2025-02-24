@@ -295,4 +295,19 @@ export const loadPrompts = async (forceRefresh = false) => {
   
   promptCache.set(cacheKey, merged);
   return merged;
+};
+
+// 在模型类型定义中添加Azure选项
+export type ChatModel = 'mistral' | 'llama' | 'azure';
+
+// 修改API调用
+export const chatWithDocument = async (
+  request: ChatRequest,
+  modelType: ChatModel
+) => {
+  const response = await axiosInstance.post('/api/chat/word', {
+    ...request,
+    model: modelType // 传递模型类型参数
+  });
+  return response.data;
 }; 

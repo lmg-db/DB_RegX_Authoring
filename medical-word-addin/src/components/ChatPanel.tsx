@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Stack, TextField, PrimaryButton, IconButton, Text, MessageBar, MessageBarType, Spinner, DefaultButton } from '@fluentui/react';
+import { Stack, TextField, PrimaryButton, IconButton, Text, MessageBar, MessageBarType, Spinner, DefaultButton, Dropdown, Icon } from '@fluentui/react';
 import { useChatStore } from '../store/chatStore';
 import { useSourceStore } from '../store/sourceStore';
 import { PromptManager } from './PromptManager';
@@ -9,6 +9,8 @@ import { TranslationDialog } from './TranslationDialog';
 import { useTranslationStore } from '../store/translationStore';
 import { api } from '../services/api';
 import { PromptsPanel } from './PromptsPanel';
+
+type ChatModel = 'mistral' | 'llama' | 'azure';
 
 export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const {
@@ -33,6 +35,7 @@ export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const [selectedText, setSelectedText] = React.useState('');
   const { translate } = useTranslationStore();
   const [showPrompts, setShowPrompts] = React.useState(false);
+  const [selectedModel, setSelectedModel] = React.useState<ChatModel>('mistral');
 
   const currentSession = sessions.find(s => s.id === currentSessionId);
 
@@ -193,7 +196,6 @@ export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
         throw new Error('No messages to insert');
       }
 
-      // 获取最后一条AI回复
       const lastAIMessage = [...currentSession.messages]
         .reverse()
         .find(msg => !msg.isUser);
@@ -382,6 +384,53 @@ export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
               minWidth: '480px'
             } 
           }}>
+            {/* 模型选择器 */}
+            <Stack.Item styles={{ 
+              root: { 
+                alignSelf: 'flex-end',  
+                marginBottom: 3
+              } 
+            }}>
+              <Dropdown
+                selectedKey={selectedModel}
+                options={[
+                  { key: 'mistral', text: 'Mistral (Local)' },
+                  { key: 'llama', text: 'Llama (Local)' },
+                  { key: 'azure', text: 'Azure GPT-4o (Cloud)' }
+                ]}
+                onChange={(_, item) => item && setSelectedModel(item.key as ChatModel)}
+                styles={{
+                  dropdown: { width: 120 },  // 稍微加宽一点
+                  title: { 
+                    fontSize: '14px',  // 调整字体大小
+                    height: '32px',    // 调整高度
+                    lineHeight: '30px', // 文字垂直居中
+                    border: '1px solid #c8c6c4',
+                    borderRadius: '4px',
+                    backgroundColor: '#fff',
+                    paddingLeft: '12px',  // 文字左对齐
+                    paddingRight: '30px', // 为下拉箭头留出空间
+                    display: 'flex',
+                    alignItems: 'center',  // 文字垂直居中
+                    justifyContent: 'flex-start' // 文字左对齐
+                  },
+                  caretDown: { 
+                    fontSize: '12px',
+                    color: '#666',
+                    right: '8px'  // 调整下拉箭头位置
+                  },
+                  dropdownItemsWrapper: {
+                    maxHeight: '300px'  // 下拉列表最大高度
+                  },
+                  dropdownItem: {
+                    fontSize: '14px',  // 下拉选项字体大小
+                    height: '32px',    // 下拉选项高度
+                    lineHeight: '30px' // 下拉选项文字垂直居中
+                  }
+                }}
+              />
+            </Stack.Item>
+
             {/* 对话显示区域 */}
             <Stack.Item grow styles={{
               root: {
@@ -606,7 +655,8 @@ export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
             <PromptManager
               onPromptSelect={handlePromptSelect}
               onExecute={handleExecute}
-              selectedModel="mistral"
+              selectedModel={selectedModel}
+              onSelectedModelChange={setSelectedModel}
               isAdminUser={isAdmin}
               selectedPrompt={selectedPrompt}
               onSelectedPromptChange={setSelectedPrompt}
@@ -671,7 +721,7 @@ export const ChatPanel: React.FC<{ onClose: () => void }> = ({ onClose }) => {
           }
         }}>
           <PromptsPanel
-            selectedModel="mistral"
+            selectedModel={selectedModel}
             initialPromptId={selectedPrompt?.id}
             onPromptSelect={(prompt) => {
               setSelectedPrompt(prompt);
