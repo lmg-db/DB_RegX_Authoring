@@ -1,6 +1,6 @@
-# Medical Word Add-in
+# RegX Authoring Word Add-in
 
-A Microsoft Word add-in for medical document processing with AI capabilities.
+A Microsoft Word add-in for regulatory submisson document authoring with AI capabilities.
 
 ## Prerequisites
 
